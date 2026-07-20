@@ -55,12 +55,28 @@ python .\自动化\main.py daily --date 2026-07-21
 python .\自动化\main.py weekly --at 2026-07-27T08:00:00+08:00
 ```
 
+任务计划程序使用 `--scheduled`，脚本会按照配置中的北京时间边界计算统计日期和周测结束时间；即使 Windows 因睡眠或延迟唤醒，也不会把实际唤醒时刻误当成统计边界：
+
+```powershell
+python .\自动化\main.py daily --scheduled
+python .\自动化\main.py weekly --scheduled
+```
+
 首次验证可加 `--no-ai`，只检查 Git、Markdown、题图和报告结构，不向外部 AI 发送图片：
 
 ```powershell
 python .\自动化\main.py daily --date 2026-07-21 --no-ai
 python .\自动化\main.py weekly --at 2026-07-27T08:00:00+08:00 --no-ai
 ```
+
+只预览而不写入报告文件：
+
+```powershell
+python .\自动化\main.py daily --date 2026-07-21 --no-ai --dry-run
+python .\自动化\main.py weekly --at 2026-07-27T08:00:00+08:00 --no-ai --dry-run
+```
+
+脚本会额外检查工作区中的未提交路径。若某个已提交错题笔记或题图仍有未提交修改，相关来源会被跳过并在报告中标记，避免把未提交内容发送给外部 AI；其他未提交文件也不会成为统计来源。
 
 ## 安装和移除 Windows 定时任务
 
@@ -69,6 +85,8 @@ python .\自动化\main.py weekly --at 2026-07-27T08:00:00+08:00 --no-ai
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\自动化\安装定时任务.ps1
 ```
+
+安装脚本会读取 `config.json` 中的时间和星期，并要求 Windows 时区为 `China Standard Time`；它只注册任务，不会提交报告或笔记。
 
 任务名称为：
 

@@ -15,6 +15,9 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $dailyTaskName = [string]$config.tasks.daily_name
 $weeklyTaskName = [string]$config.tasks.weekly_name
+$dailyTime = [string]$config.daily.time
+$weeklyTime = [string]$config.weekly.time
+$weeklyDay = [System.Enum]::Parse([System.DayOfWeek], [string]$config.weekly.weekday, $true)
 
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pythonCommand) {
@@ -28,7 +31,7 @@ $pythonPath = $pythonCommand.Source
 $currentUser = "$env:USERDOMAIN\$env:USERNAME"
 $timeZone = Get-TimeZone
 if ($timeZone.Id -ne 'China Standard Time') {
-    Write-Warning "Current Windows time zone is $($timeZone.Id), not China Standard Time."
+    throw "Windows time zone must be China Standard Time for Beijing schedules; current value: $($timeZone.Id)"
 }
 
 function Register-ReviewTask {
@@ -39,10 +42,10 @@ function Register-ReviewTask {
         [string]$Description
     )
 
-    $arguments = '"{0}" {1}' -f $scriptPath, $Subcommand
+    $arguments = '"{0}" {1} --scheduled' -f $scriptPath, $Subcommand
     $action = New-ScheduledTaskAction -Execute $pythonPath -Argument $arguments -WorkingDirectory $repoRoot
     if ($Subcommand -eq 'weekly') {
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At $StartTime
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weeklyDay -At $StartTime
     }
     else {
         $trigger = New-ScheduledTaskTrigger -Daily -At $StartTime
@@ -63,15 +66,15 @@ function Register-ReviewTask {
 Register-ReviewTask `
     -TaskName $dailyTaskName `
     -Subcommand 'daily' `
-    -StartTime '22:30' `
-    -Description 'Daily committed wrong-question report at Beijing time 22:30.'
+    -StartTime $dailyTime `
+    -Description "Daily committed wrong-question report at Beijing time $dailyTime."
 
 Register-ReviewTask `
     -TaskName $weeklyTaskName `
     -Subcommand 'weekly' `
-    -StartTime '08:00' `
-    -Description 'Weekly math and 408 test at Beijing time on Sunday 08:00.'
+    -StartTime $weeklyTime `
+    -Description "Weekly math and 408 test at Beijing time on $($config.weekly.weekday) $weeklyTime."
 
-Write-Output "Registered task: $dailyTaskName (daily 22:30)"
-Write-Output "Registered task: $weeklyTaskName (Sunday 08:00)"
+Write-Output "Registered task: $dailyTaskName (daily $dailyTime, Beijing time)"
+Write-Output "Registered task: $weeklyTaskName ($($config.weekly.weekday) $weeklyTime, Beijing time)"
 Write-Output 'Reports are generated under the report directories and are not committed automatically.'

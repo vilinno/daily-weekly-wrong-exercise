@@ -43,6 +43,15 @@ ALLOWED_MESSAGE_RES = (
 IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]*)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 SOURCE_ID_RE = re.compile(r"\bS\d{3}\b")
+WEEKDAY_NUMBERS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 
 
 def get_timezone() -> dt.tzinfo:
@@ -131,9 +140,67 @@ def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         raise WorkflowError(f"缺少配置文件：{CONFIG_PATH}")
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise WorkflowError(f"配置文件不是有效 JSON：{CONFIG_PATH}\n{exc}") from exc
+    return validate_config(config)
+
+
+def parse_clock_time(value: Any, label: str) -> dt.time:
+    text = str(value).strip()
+    match = re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text)
+    if not match:
+        raise WorkflowError(f"{label} 应为 24 小时制 HH:MM，例如 22:30；当前值：{value}")
+    hour, minute = (int(part) for part in text.split(":"))
+    return dt.time(hour=hour, minute=minute)
+
+
+def parse_weekday(value: Any, label: str = "weekly.weekday") -> int:
+    key = str(value).strip().lower()
+    if key not in WEEKDAY_NUMBERS:
+        allowed = ", ".join(name.title() for name in WEEKDAY_NUMBERS)
+        raise WorkflowError(f"{label} 应为英文星期名称（{allowed}）；当前值：{value}")
+    return WEEKDAY_NUMBERS[key]
+
+
+def validate_config(config: Any) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        raise WorkflowError("配置文件顶层必须是 JSON 对象。")
+    if config.get("timezone") != "Asia/Shanghai":
+        raise WorkflowError("配置中的 timezone 必须是 Asia/Shanghai（北京时间）。")
+
+    daily = config.get("daily")
+    weekly = config.get("weekly")
+    subjects = config.get("subjects")
+    reports = config.get("reports")
+    if not isinstance(daily, dict) or not isinstance(weekly, dict):
+        raise WorkflowError("配置必须同时包含 daily 和 weekly 配置。")
+    if not isinstance(subjects, dict) or not {"数学", "408"}.issubset(subjects):
+        raise WorkflowError("subjects 必须同时配置数学和 408，且两科要分开生成报告。")
+    if not isinstance(reports, dict) or not reports.get("daily") or not reports.get("weekly"):
+        raise WorkflowError("reports 必须配置 daily 和 weekly 输出目录。")
+
+    parse_clock_time(daily.get("time"), "daily.time")
+    parse_clock_time(weekly.get("time"), "weekly.time")
+    parse_weekday(weekly.get("weekday"))
+    try:
+        window_days = int(weekly.get("window_days", 7))
+        questions = int(weekly.get("questions_per_subject", 10))
+        variant_ratio = float(weekly.get("variant_ratio", 0.3))
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("weekly.window_days、questions_per_subject、variant_ratio 必须是数字。") from exc
+    if window_days <= 0:
+        raise WorkflowError("weekly.window_days 必须大于 0。")
+    if questions <= 0:
+        raise WorkflowError("weekly.questions_per_subject 必须大于 0。")
+    if not 0 <= variant_ratio <= 1:
+        raise WorkflowError("weekly.variant_ratio 必须在 0 到 1 之间。")
+
+    for key in ("daily", "weekly"):
+        report_path = Path(str(reports[key]))
+        if report_path.is_absolute() or ".." in report_path.parts:
+            raise WorkflowError(f"reports.{key} 必须是仓库内的相对目录。")
+    return config
 
 
 def run_git(*args: str) -> str:
@@ -150,6 +217,30 @@ def run_git(*args: str) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise WorkflowError(f"Git 命令执行失败：git {' '.join(args)}\n{detail}")
     return completed.stdout
+
+
+def normalize_repo_path(relative_path: str) -> str:
+    normalized = relative_path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def read_uncommitted_paths() -> set[str]:
+    """返回工作区中未提交的路径，供统计时排除。"""
+    paths: set[str] = set()
+    commands = (
+        ("-c", "core.quotePath=false", "diff", "--name-only"),
+        ("-c", "core.quotePath=false", "diff", "--cached", "--name-only"),
+        ("-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard"),
+    )
+    for command in commands:
+        output = run_git(*command)
+        for line in output.splitlines():
+            normalized = normalize_repo_path(line.strip())
+            if normalized:
+                paths.add(normalized)
+    return paths
 
 
 def parse_git_datetime(value: str) -> dt.datetime:
@@ -241,13 +332,13 @@ def collect_changed_paths(commits: Iterable[Commit]) -> dict[str, set[str]]:
     changed: dict[str, set[str]] = {}
     for commit in commits:
         for status, path in changed_paths_for_commit(commit):
-            normalized = path.replace("\\", "/").lstrip("./")
+            normalized = normalize_repo_path(path)
             changed.setdefault(normalized, set()).add(status)
     return changed
 
 
 def is_ignored_source_path(relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = normalize_repo_path(relative_path)
     first = normalized.split("/", 1)[0]
     return first in {".git", "自动化", "报告", "过渡站"} or normalized in {
         "README.md",
@@ -267,7 +358,7 @@ def relative_repo_path(path: Path) -> str:
 
 
 def subject_for_path(relative_path: str, subjects: dict[str, str]) -> str | None:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = normalize_repo_path(relative_path)
     first = normalized.split("/", 1)[0]
     for subject, configured_path in subjects.items():
         configured = configured_path.replace("\\", "/").strip("/")
@@ -368,8 +459,10 @@ def build_subject_bundle(
     subject: str,
     changed_paths: dict[str, set[str]],
     configured_path: str,
+    dirty_paths: set[str] | None = None,
 ) -> SubjectBundle:
     prefix = configured_path.replace("\\", "/").strip("/")
+    dirty_paths = {normalize_repo_path(path) for path in (dirty_paths or set())}
     subject_changed = sorted(
         path
         for path in changed_paths
@@ -389,6 +482,11 @@ def build_subject_bundle(
     for relative_path in subject_changed:
         if not relative_path.lower().endswith(".md"):
             continue
+        if relative_path in dirty_paths:
+            problems.append(
+                f"跳过未提交的 Markdown：`{relative_path}`；本次只统计已提交内容。"
+            )
+            continue
         note_path = repo_path(relative_path)
         if not note_path.exists():
             problems.append(f"提交中涉及的 Markdown 当前不存在：`{relative_path}`")
@@ -407,12 +505,40 @@ def build_subject_bundle(
                 )
             )
 
+    clean_sources: list[Source] = []
+    for source in sources:
+        blocked_paths = [
+            relative_repo_path(path)
+            for path in (source.note_path, source.image_path)
+            if path is not None and relative_repo_path(path) in dirty_paths
+        ]
+        if blocked_paths:
+            problems.append(
+                "跳过包含未提交内容的来源："
+                + ", ".join(f"`{path}`" for path in blocked_paths)
+                + "；本次只统计已提交内容。"
+            )
+            continue
+        clean_sources.append(source)
+    sources = clean_sources
+    note_texts = {
+        path: content
+        for path, content in note_texts.items()
+        if relative_repo_path(path) not in dirty_paths
+    }
+
     for source in sources:
         if source.image_path:
             seen_image_paths.add(source.image_path)
 
     for image_path in changed_images:
         if image_path in seen_image_paths:
+            continue
+        image_relative = relative_repo_path(image_path)
+        if image_relative in dirty_paths:
+            problems.append(
+                f"跳过未提交的题图：`{image_relative}`；本次只统计已提交内容。"
+            )
             continue
         sources.append(
             Source(
@@ -696,6 +822,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         endpoint,
         data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
         headers={
+            "User-Agent": "daily-wrong-question/1.0",
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
@@ -790,6 +917,41 @@ def current_run_time() -> dt.datetime:
     return dt.datetime.now(tz=BEIJING)
 
 
+def as_beijing(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=BEIJING)
+    return value.astimezone(BEIJING)
+
+
+def scheduled_daily_date(
+    schedule_time: str, now: dt.datetime | None = None
+) -> dt.date:
+    """计算最近一次应执行的每日统计日期，适配任务计划程序延迟唤醒。"""
+    now = as_beijing(now or current_run_time())
+    scheduled = dt.datetime.combine(
+        now.date(), parse_clock_time(schedule_time, "daily.time"), tzinfo=BEIJING
+    )
+    if now < scheduled:
+        return now.date() - dt.timedelta(days=1)
+    return now.date()
+
+
+def scheduled_weekly_end(
+    weekday: str, schedule_time: str, now: dt.datetime | None = None
+) -> dt.datetime:
+    """计算最近一次应执行的周测结束时间，而不是使用实际唤醒时间。"""
+    now = as_beijing(now or current_run_time())
+    target_weekday = parse_weekday(weekday)
+    days_since_target = (now.weekday() - target_weekday) % 7
+    candidate_date = now.date() - dt.timedelta(days=days_since_target)
+    candidate = dt.datetime.combine(
+        candidate_date, parse_clock_time(schedule_time, "weekly.time"), tzinfo=BEIJING
+    )
+    if now < candidate:
+        candidate -= dt.timedelta(days=7)
+    return candidate
+
+
 def parse_date(value: str) -> dt.date:
     try:
         return dt.date.fromisoformat(value)
@@ -819,6 +981,15 @@ def all_commits_in_local_day(commits: Iterable[Commit], target_date: dt.date) ->
     )
 
 
+def write_or_preview_report(path: Path, content: str, write: bool) -> None:
+    if write:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8", newline="\n")
+        return
+    print(f"===== 预览：{relative_repo_path(path)} =====")
+    print(content, end="" if content.endswith("\n") else "\n")
+
+
 def daily_report(
     target_date: dt.date,
     config: dict[str, Any],
@@ -830,6 +1001,7 @@ def daily_report(
     day_commits = all_commits_in_local_day(commits, target_date)
     changed = collect_changed_paths(daily_commits)
     subjects = config.get("subjects", {})
+    dirty_paths = read_uncommitted_paths()
     report_dir = ROOT / config["reports"]["daily"]
     report_path = report_dir / f"日报-{target_date.isoformat()}.md"
 
@@ -859,12 +1031,33 @@ def daily_report(
         lines.append("")
 
     lines.extend(["## 变更文件", "", format_changed_files(changed), ""])
+    lines.extend(
+        [
+            "## 未提交内容",
+            "",
+            "- 工作区中的未提交内容不会纳入本次统计。",
+            "",
+        ]
+    )
+    dirty_source_paths = sorted(
+        path for path in dirty_paths if subject_for_path(path, subjects) is not None
+    )
+    if dirty_source_paths:
+        lines.extend(
+            [
+                "以下科目文件当前存在未提交修改，相关来源已跳过：",
+                *[f"- `{path}`" for path in dirty_source_paths],
+                "",
+            ]
+        )
+    else:
+        lines.extend(["- 未发现数学或 408 目录下的未提交文件。", ""])
     lines.extend(["## 科目统计", ""])
     if not daily_commits:
         lines.append("本日没有可统计的 daily 提交，因此不调用 AI，不生成题目归纳。")
     else:
         for subject, configured_path in subjects.items():
-            bundle = build_subject_bundle(subject, changed, configured_path)
+            bundle = build_subject_bundle(subject, changed, configured_path, dirty_paths)
             lines.append(f"### {subject}")
             lines.append("")
             lines.append(
@@ -895,11 +1088,7 @@ def daily_report(
             lines.extend(["", "#### 来源索引", "", source_index_markdown(bundle, report_path), ""])
 
     content = "\n".join(lines).rstrip() + "\n"
-    if write:
-        report_dir.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(content, encoding="utf-8", newline="\n")
-    else:
-        print(content)
+    write_or_preview_report(report_path, content, write)
     return report_path
 
 
@@ -912,13 +1101,13 @@ def weekly_report_for_subject(
     use_ai: bool,
     report_path: Path,
     answer_path: Path,
+    write: bool = True,
+    dirty_paths: set[str] | None = None,
 ) -> tuple[Path, Path]:
     commits = read_commits()
     weekly_commits = commits_for_week(commits, start, end)
     changed = collect_changed_paths(weekly_commits)
-    bundle = build_subject_bundle(subject, changed, configured_path)
-    report_dir = report_path.parent
-    report_dir.mkdir(parents=True, exist_ok=True)
+    bundle = build_subject_bundle(subject, changed, configured_path, dirty_paths)
 
     metadata = [
         f"> 生成时间：{end.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
@@ -956,8 +1145,8 @@ def weekly_report_for_subject(
                 "",
             ]
         )
-        report_path.write_text(question_content, encoding="utf-8", newline="\n")
-        answer_path.write_text(answer_content, encoding="utf-8", newline="\n")
+        write_or_preview_report(report_path, question_content, write)
+        write_or_preview_report(answer_path, answer_content, write)
         return report_path, answer_path
 
     if use_ai:
@@ -1011,8 +1200,8 @@ def weekly_report_for_subject(
             "",
         ]
     )
-    report_path.write_text(question_content, encoding="utf-8", newline="\n")
-    answer_path.write_text(answer_content, encoding="utf-8", newline="\n")
+    write_or_preview_report(report_path, question_content, write)
+    write_or_preview_report(answer_path, answer_content, write)
     return report_path, answer_path
 
 
@@ -1020,12 +1209,14 @@ def weekly_reports(
     end: dt.datetime,
     config: dict[str, Any],
     use_ai: bool = True,
+    write: bool = True,
 ) -> list[Path]:
     window_days = int(config.get("weekly", {}).get("window_days", 7))
     start = end - dt.timedelta(days=window_days)
     week_date = (end.date() - dt.timedelta(days=1)).isocalendar()
     week_id = f"{week_date.year}-W{week_date.week:02d}"
     report_dir = ROOT / config["reports"]["weekly"]
+    dirty_paths = read_uncommitted_paths()
     outputs: list[Path] = []
     for subject, configured_path in config.get("subjects", {}).items():
         report_path = report_dir / f"周测-{week_id}-{subject}.md"
@@ -1039,6 +1230,8 @@ def weekly_reports(
             use_ai,
             report_path,
             answer_path,
+            write=write,
+            dirty_paths=dirty_paths,
         )
         outputs.extend([report_path, answer_path])
     return outputs
@@ -1047,9 +1240,15 @@ def weekly_reports(
 def check_workflow(target_date: dt.date | None = None, at: dt.datetime | None = None) -> dict[str, Any]:
     config = load_config()
     commits = read_commits()
+    dirty_paths = read_uncommitted_paths()
     result: dict[str, Any] = {
         "timezone": "Asia/Shanghai",
         "root": str(ROOT),
+        "uncommitted_source_paths": sorted(
+            path
+            for path in dirty_paths
+            if subject_for_path(path, config.get("subjects", {})) is not None
+        ),
         "allowed_commit_examples": [
             "daily: YYYY-MM-DD",
             "weekly: YYYY-Www",
@@ -1067,8 +1266,12 @@ def check_workflow(target_date: dt.date | None = None, at: dt.datetime | None = 
             "changed_paths": sorted(changed),
             "subjects": {
                 subject: {
-                    "sources": len(build_subject_bundle(subject, changed, path).sources),
-                    "problems": build_subject_bundle(subject, changed, path).problems,
+                    "sources": len(
+                        build_subject_bundle(subject, changed, path, dirty_paths).sources
+                    ),
+                    "problems": build_subject_bundle(
+                        subject, changed, path, dirty_paths
+                    ).problems,
                 }
                 for subject, path in config.get("subjects", {}).items()
             },
@@ -1092,11 +1295,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     daily = subparsers.add_parser("daily", help="生成每日统计")
     daily.add_argument("--date", help="按指定北京时间日期运行：YYYY-MM-DD")
+    daily.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="按配置中的每日时间计算最近一次应统计的日期，适合任务计划程序延迟运行",
+    )
     daily.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅生成结构检查报告")
+    daily.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
 
     weekly = subparsers.add_parser("weekly", help="生成数学和 408 周测")
     weekly.add_argument("--at", help="指定周测结束时间，例如 2026-07-26T08:00:00+08:00")
+    weekly.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="按配置中的星期和时间计算最近一次周测结束时间，适合任务计划程序延迟运行",
+    )
     weekly.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅生成无题目占位报告")
+    weekly.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
 
     check = subparsers.add_parser("check", help="只读检查 Git 和题图/笔记解析，不写入报告")
     check.add_argument("--date", help="检查指定每日日期：YYYY-MM-DD")
@@ -1111,15 +1326,39 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config()
         if args.command == "daily":
-            target_date = parse_date(args.date) if args.date else current_run_time().date()
-            path = daily_report(target_date, config, use_ai=not args.no_ai)
-            print(f"已生成：{path}")
+            if args.date and args.scheduled:
+                raise WorkflowError("daily 不能同时使用 --date 和 --scheduled。")
+            if args.scheduled:
+                target_date = scheduled_daily_date(str(config["daily"]["time"]))
+            else:
+                target_date = parse_date(args.date) if args.date else current_run_time().date()
+            path = daily_report(
+                target_date,
+                config,
+                use_ai=not args.no_ai,
+                write=not args.dry_run,
+            )
+            if not args.dry_run:
+                print(f"已生成：{path}")
             return 0
         if args.command == "weekly":
-            end = parse_datetime(args.at)
-            outputs = weekly_reports(end, config, use_ai=not args.no_ai)
-            for path in outputs:
-                print(f"已生成：{path}")
+            if args.at and args.scheduled:
+                raise WorkflowError("weekly 不能同时使用 --at 和 --scheduled。")
+            if args.scheduled:
+                end = scheduled_weekly_end(
+                    str(config["weekly"]["weekday"]), str(config["weekly"]["time"])
+                )
+            else:
+                end = parse_datetime(args.at)
+            outputs = weekly_reports(
+                end,
+                config,
+                use_ai=not args.no_ai,
+                write=not args.dry_run,
+            )
+            if not args.dry_run:
+                for path in outputs:
+                    print(f"已生成：{path}")
             return 0
         if args.command == "check":
             target_date = parse_date(args.date) if args.date else None

@@ -1,6 +1,6 @@
 import sys
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 
@@ -11,6 +11,41 @@ import main  # noqa: E402
 
 
 class WorkflowUnitTests(unittest.TestCase):
+    def test_scheduled_daily_date_uses_beijing_boundary(self):
+        before = datetime(2026, 7, 21, 22, 29, tzinfo=main.BEIJING)
+        at_boundary = datetime(2026, 7, 21, 22, 30, tzinfo=main.BEIJING)
+        self.assertEqual(main.scheduled_daily_date("22:30", before), date(2026, 7, 20))
+        self.assertEqual(
+            main.scheduled_daily_date("22:30", at_boundary), date(2026, 7, 21)
+        )
+
+    def test_scheduled_weekly_end_uses_previous_boundary_when_late(self):
+        before = datetime(2026, 7, 26, 7, 59, tzinfo=main.BEIJING)
+        at_boundary = datetime(2026, 7, 26, 8, 0, tzinfo=main.BEIJING)
+        self.assertEqual(
+            main.scheduled_weekly_end("Sunday", "08:00", before),
+            datetime(2026, 7, 19, 8, 0, tzinfo=main.BEIJING),
+        )
+        self.assertEqual(
+            main.scheduled_weekly_end("Sunday", "08:00", at_boundary),
+            datetime(2026, 7, 26, 8, 0, tzinfo=main.BEIJING),
+        )
+
+    def test_dirty_note_is_not_used_as_source(self):
+        changed = {"数学/高等数学/多元微分.md": {"M"}}
+        bundle = main.build_subject_bundle(
+            "数学",
+            changed,
+            "数学",
+            {"数学/高等数学/多元微分.md"},
+        )
+        self.assertEqual(bundle.sources, [])
+        self.assertTrue(any("未提交" in problem for problem in bundle.problems))
+
+    def test_validate_config_requires_beijing_timezone(self):
+        with self.assertRaises(main.WorkflowError):
+            main.validate_config({"timezone": "UTC"})
+
     def test_commit_message_rules(self):
         self.assertTrue(main.is_allowed_message("daily: 2026-07-21"))
         self.assertTrue(main.is_allowed_message("docs: 更新说明"))
