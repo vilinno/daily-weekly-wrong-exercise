@@ -50,6 +50,35 @@ class WorkflowUnitTests(unittest.TestCase):
         self.assertIn("测试题", test)
         self.assertIn("答案与核验", answer)
 
+    def test_chat_endpoint_from_base_url(self):
+        old_base = main.os.environ.get("OPENAI_BASE_URL")
+        old_explicit = main.os.environ.get("OPENAI_CHAT_COMPLETIONS_URL")
+        try:
+            main.os.environ["OPENAI_BASE_URL"] = "https://example.test"
+            main.os.environ.pop("OPENAI_CHAT_COMPLETIONS_URL", None)
+            self.assertEqual(
+                main.chat_completions_endpoint({}),
+                "https://example.test/v1/chat/completions",
+            )
+            main.os.environ["OPENAI_CHAT_COMPLETIONS_URL"] = "https://example.test/custom"
+            self.assertEqual(
+                main.chat_completions_endpoint({}),
+                "https://example.test/custom",
+            )
+        finally:
+            if old_base is None:
+                main.os.environ.pop("OPENAI_BASE_URL", None)
+            else:
+                main.os.environ["OPENAI_BASE_URL"] = old_base
+            if old_explicit is None:
+                main.os.environ.pop("OPENAI_CHAT_COMPLETIONS_URL", None)
+            else:
+                main.os.environ["OPENAI_CHAT_COMPLETIONS_URL"] = old_explicit
+
+    def test_chat_response_parser(self):
+        payload = {"choices": [{"message": {"content": "测试成功"}}]}
+        self.assertEqual(main.extract_chat_response_text(payload), "测试成功")
+
     def test_source_id_links_point_to_image(self):
         image = main.ROOT / "数学" / "高等数学" / "assets" / "示例.png"
         report = main.ROOT / "报告" / "每周" / "周测.md"

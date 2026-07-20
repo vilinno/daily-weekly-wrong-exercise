@@ -23,8 +23,8 @@
     "weekly_name": "每日错题-周测"
   },
   "ai": {
-    "default_model": "gpt-4.1-mini",
-    "responses_url": "https://api.openai.com/v1/responses",
+    "default_model": "gpt-5.6-sol",
+    "chat_completions_url": "",
     "max_output_tokens": 6000,
     "timeout_seconds": 180
   }

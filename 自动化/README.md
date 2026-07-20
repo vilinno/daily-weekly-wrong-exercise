@@ -33,14 +33,15 @@ fix: 修复说明
 
 ## 配置 AI
 
-脚本使用 OpenAI Responses API，并将题图作为 Base64 图片输入。配置文件中的模型只是默认值，可使用环境变量覆盖。
+脚本使用 OpenAI 兼容的 Chat Completions API，并将题图作为 `image_url` Base64 图片输入。当前约定的模型是 `gpt-5.6-sol`，配置文件中的模型只是默认值，可使用环境变量覆盖。
 
 推荐配置方式：
 
 1. 将 `.env.example` 复制为 `.env`。
 2. 在 `.env` 中填写 `OPENAI_API_KEY`。
-3. 按账户可用模型设置 `OPENAI_MODEL`；未设置时使用 `gpt-4.1-mini`。
-4. 不要把 `.env` 提交到 Git。
+3. 设置 `OPENAI_BASE_URL`，脚本会拼接 `/v1/chat/completions`；也可以直接设置 `OPENAI_CHAT_COMPLETIONS_URL`。
+4. 设置 `OPENAI_MODEL`；未设置时使用 `gpt-5.6-sol`。
+5. 不要把 `.env` 提交到 Git。
 
 也可以直接设置 Windows 用户环境变量。脚本不会在日志或报告中输出密钥。
 

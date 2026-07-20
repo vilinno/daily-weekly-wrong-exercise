@@ -610,24 +610,45 @@ def weekly_prompt(
     ).strip()
 
 
-def extract_response_text(payload: dict[str, Any]) -> str:
-    output_text = payload.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    chunks: list[str] = []
-    for item in payload.get("output", []):
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []):
-            if not isinstance(content, dict):
-                continue
-            if content.get("type") in {"output_text", "text"}:
-                value = content.get("text")
-                if isinstance(value, str):
-                    chunks.append(value)
-    if chunks:
-        return "\n".join(chunks).strip()
-    raise WorkflowError("AI 返回中没有可读取的文本内容。")
+def extract_chat_response_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise WorkflowError("Chat Completions 返回中没有 choices。")
+    message = choices[0].get("message", {})
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                text_value = part.get("text") or part.get("content")
+                if isinstance(text_value, str):
+                    chunks.append(text_value)
+        if "\n".join(chunks).strip():
+            return "\n".join(chunks).strip()
+    if isinstance(message, dict) and message.get("reasoning_content"):
+        raise WorkflowError("AI 只返回了 reasoning_content，没有返回可用的正文。")
+    raise WorkflowError("Chat Completions 返回中没有可读取的正文内容。")
+
+
+def chat_completions_endpoint(config: dict[str, Any]) -> str:
+    explicit = os.environ.get("OPENAI_CHAT_COMPLETIONS_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+    if base_url:
+        if base_url.endswith("/chat/completions"):
+            return base_url
+        if base_url.endswith("/v1"):
+            return base_url + "/chat/completions"
+        return base_url + "/v1/chat/completions"
+    configured = config.get("ai", {}).get("chat_completions_url", "")
+    if configured:
+        return str(configured).rstrip("/")
+    return "https://api.openai.com/v1/chat/completions"
 
 
 def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> str:
@@ -638,12 +659,10 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         )
     ai_config = config.get("ai", {})
     model = os.environ.get("OPENAI_MODEL", "").strip() or ai_config.get(
-        "default_model", "gpt-4.1-mini"
+        "default_model", "gpt-5.6-sol"
     )
-    endpoint = os.environ.get("OPENAI_RESPONSES_URL", "").strip() or ai_config.get(
-        "responses_url", "https://api.openai.com/v1/responses"
-    )
-    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    endpoint = chat_completions_endpoint(config)
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for image_path in unique_image_paths(bundle):
         mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
@@ -654,21 +673,24 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         ]
         content.append(
             {
-                "type": "input_text",
+                "type": "text",
                 "text": f"以下图片对应来源编号：{', '.join(source_ids)}。请结合图片文字与前面的 Markdown。",
             }
         )
         content.append(
             {
-                "type": "input_image",
-                "image_url": f"data:{mime_type};base64,{encoded}",
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{encoded}",
+                },
             }
         )
 
     request_body = {
         "model": model,
-        "input": [{"role": "user", "content": content}],
-        "max_output_tokens": int(ai_config.get("max_output_tokens", 6000)),
+        "messages": [{"role": "user", "content": content}],
+        "max_completion_tokens": int(ai_config.get("max_output_tokens", 6000)),
+        "stream": False,
     }
     request = urllib.request.Request(
         endpoint,
@@ -697,7 +719,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         raise WorkflowError("OpenAI API 请求超时。") from exc
 
     try:
-        return extract_response_text(json.loads(raw))
+        return extract_chat_response_text(json.loads(raw))
     except json.JSONDecodeError as exc:
         raise WorkflowError("OpenAI API 返回的内容不是有效 JSON。") from exc
 
