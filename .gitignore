@@ -4,3 +4,5 @@
 自动化/__pycache__/
 自动化/tests/__pycache__/
 *.pyc
+
+.obsidian/
