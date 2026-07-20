@@ -1,0 +1,6 @@
+# 自动化本地凭据、运行日志和 Python 缓存
+自动化/.env
+自动化/logs/
+自动化/__pycache__/
+自动化/tests/__pycache__/
+*.pyc
