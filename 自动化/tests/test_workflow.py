@@ -2,6 +2,7 @@ import sys
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 
 AUTOMATION_DIR = Path(__file__).resolve().parents[1]
@@ -60,6 +61,29 @@ class WorkflowUnitTests(unittest.TestCase):
             )
         ]
         self.assertEqual(main.commits_for_daily(commits, date(2026, 7, 21)), commits)
+
+    def test_changed_paths_request_unquoted_non_ascii_paths(self):
+        commit = main.Commit(
+            "abc123456789",
+            main.parse_git_datetime("2026-07-21T14:30:00+08:00"),
+            "daily: 2026-07-21",
+        )
+        git_output = "M\t数学/高等数学/无穷级数.md\n"
+        with patch.object(main, "run_git", return_value=git_output) as run_git:
+            self.assertEqual(
+                main.changed_paths_for_commit(commit),
+                [("M", "数学/高等数学/无穷级数.md")],
+            )
+        run_git.assert_called_once_with(
+            "-c",
+            "core.quotePath=false",
+            "show",
+            "--format=",
+            "--name-status",
+            "--find-renames",
+            "--find-copies",
+            commit.sha,
+        )
 
     def test_parse_image_target(self):
         self.assertEqual(main.parse_image_target("<assets/题图.png>"), "assets/题图.png")

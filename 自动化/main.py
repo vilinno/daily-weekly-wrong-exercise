@@ -308,6 +308,8 @@ def commits_for_week(
 
 def changed_paths_for_commit(commit: Commit) -> list[tuple[str, str]]:
     output = run_git(
+        "-c",
+        "core.quotePath=false",
         "show",
         "--format=",
         "--name-status",
