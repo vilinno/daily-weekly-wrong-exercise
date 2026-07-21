@@ -40,7 +40,7 @@ fix: 修复说明
 1. 将 `.env.example` 复制为 `.env`。
 2. 在 `.env` 中填写 `OPENAI_API_KEY`。
 3. 设置 `OPENAI_BASE_URL`，脚本会拼接 `/v1/chat/completions`；也可以直接设置 `OPENAI_CHAT_COMPLETIONS_URL`。
-4. 设置 `OPENAI_MODEL`；未设置时使用 `gpt-5.6-sol`。
+4. 设置 `OPENAI_MODEL`；未设置时使用 `claude-opus-4-8`。
 5. 不要把 `.env` 提交到 Git。
 
 也可以直接设置 Windows 用户环境变量。脚本不会在日志或报告中输出密钥。

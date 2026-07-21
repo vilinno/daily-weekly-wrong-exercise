@@ -785,7 +785,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         )
     ai_config = config.get("ai", {})
     model = os.environ.get("OPENAI_MODEL", "").strip() or ai_config.get(
-        "default_model", "gpt-5.6-sol"
+        "default_model", "claude-opus-4-8"
     )
     endpoint = chat_completions_endpoint(config)
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -815,7 +815,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
     request_body = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
-        "max_completion_tokens": int(ai_config.get("max_output_tokens", 6000)),
+        "max_completion_tokens": int(ai_config.get("max_output_tokens", 4096)),
         "stream": False,
     }
     request = urllib.request.Request(
