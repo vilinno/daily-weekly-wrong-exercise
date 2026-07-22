@@ -2,6 +2,7 @@ import sys
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -89,6 +90,41 @@ class WorkflowUnitTests(unittest.TestCase):
         self.assertEqual(main.parse_image_target("<assets/题图.png>"), "assets/题图.png")
         self.assertEqual(main.parse_image_target("assets/题图.png \"题目\""), "assets/题图.png")
 
+    def test_parse_obsidian_image_target_ignores_size(self):
+        self.assertEqual(
+            main.parse_obsidian_image_target("assets/题图.png|640x480"),
+            "assets/题图.png",
+        )
+
+    def test_iter_image_targets_supports_both_markdown_syntaxes(self):
+        line = "![标准图片](assets/a.png) ![[b.png|300]] ![[说明.md]]"
+        self.assertEqual(
+            list(main.iter_image_targets(line)),
+            ["assets/a.png", "b.png"],
+        )
+
+    def test_parse_note_images_resolves_obsidian_embed_to_note(self):
+        with TemporaryDirectory(dir=main.ROOT) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            note_path = temporary_root / "笔记" / "示例.md"
+            image_path = temporary_root / "assets" / "题图.png"
+            note_path.parent.mkdir(parents=True)
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"not-a-real-image")
+            note_path.write_text(
+                "# 示例\n\n## 题目\n\n![[题图.png|640x480]]\n",
+                encoding="utf-8",
+            )
+
+            _, sources, problems = main.parse_note_images(note_path, "数学")
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].raw_image_ref, "题图.png")
+        self.assertEqual(sources[0].note_path, note_path.resolve())
+        self.assertEqual(sources[0].image_path, image_path.resolve())
+        self.assertEqual(sources[0].headings, ["示例", "题目"])
+
     def test_split_weekly_output(self):
         value = """
         <SUMMARY>
@@ -156,7 +192,76 @@ class WorkflowUnitTests(unittest.TestCase):
             note_texts={},
         )
         linked = main.link_source_ids("方法说明（来源：S001）", bundle, report)
-        self.assertIn("[S001](../../数学/高等数学/assets/示例.png)", linked)
+        self.assertIn(
+            "[[数学/高等数学/assets/示例.png|S001]]",
+            linked,
+        )
+        self.assertEqual(
+            main.link_source_ids(linked, bundle, report),
+            linked,
+        )
+
+    def test_obsidian_link_uses_vault_relative_target(self):
+        self.assertEqual(
+            main.obsidian_link("打开笔记", "数学/高等数学/无穷级数.md"),
+            "[[数学/高等数学/无穷级数.md|打开笔记]]",
+        )
+        self.assertEqual(
+            main.obsidian_link(None, "数学/高等数学/无穷级数.md"),
+            "[[数学/高等数学/无穷级数.md]]",
+        )
+
+    def test_source_index_uses_obsidian_links_for_image_and_note(self):
+        image = main.ROOT / "数学" / "高等数学" / "assets" / "无穷级数-作差证收敛.png"
+        note = main.ROOT / "数学" / "高等数学" / "无穷级数.md"
+        report = main.ROOT / "报告" / "每日" / "日报-测试.md"
+        bundle = main.SubjectBundle(
+            subject="数学",
+            changed_paths=[],
+            sources=[
+                main.Source(
+                    source_id="S001",
+                    subject="数学",
+                    image_path=image,
+                    note_path=note,
+                    headings=["级数", "作差"],
+                )
+            ],
+            problems=[],
+            note_texts={},
+        )
+
+        index = main.source_index_markdown(bundle, report)
+
+        self.assertIn(
+            "[[数学/高等数学/assets/无穷级数-作差证收敛.png]]",
+            index,
+        )
+        self.assertIn(
+            "[[数学/高等数学/无穷级数.md]]",
+            index,
+        )
+
+    def test_source_id_link_in_table_does_not_add_alias_pipe(self):
+        image = main.ROOT / "数学" / "高等数学" / "assets" / "示例.png"
+        report = main.ROOT / "报告" / "每周" / "周测.md"
+        bundle = main.SubjectBundle(
+            subject="数学",
+            changed_paths=[],
+            sources=[
+                main.Source(
+                    source_id="S001",
+                    subject="数学",
+                    image_path=image,
+                )
+            ],
+            problems=[],
+            note_texts={},
+        )
+
+        linked = main.link_source_ids("| 来源 | S001 |\n|---|---|", bundle, report)
+
+        self.assertEqual(linked, "| 来源 | [[数学/高等数学/assets/示例.png]] |\n|---|---|")
 
 
 if __name__ == "__main__":

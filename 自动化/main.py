@@ -41,6 +41,7 @@ ALLOWED_MESSAGE_RES = (
     re.compile(r"^(?:docs|chore|fix): .+$"),
 )
 IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]*)\)")
+OBSIDIAN_IMAGE_RE = re.compile(r"!\[\[([^\]\r\n]+)\]\]")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 SOURCE_ID_RE = re.compile(r"\bS\d{3}\b")
 WEEKDAY_NUMBERS = {
@@ -381,6 +382,31 @@ def parse_image_target(inner: str) -> str:
     return value.split()[0] if value.split() else ""
 
 
+def parse_obsidian_image_target(inner: str) -> str:
+    """提取 Obsidian 图片嵌入中的仓库内路径，忽略尺寸或别名。"""
+    value = inner.strip()
+    if "|" in value:
+        value = value.split("|", 1)[0]
+    return value.strip()
+
+
+def iter_image_targets(line: str) -> Iterable[str]:
+    """按原文顺序返回标准 Markdown 和 Obsidian 图片引用。"""
+    matches: list[tuple[int, str]] = []
+    matches.extend(
+        (match.start(), parse_image_target(match.group(1)))
+        for match in IMAGE_RE.finditer(line)
+    )
+    for match in OBSIDIAN_IMAGE_RE.finditer(line):
+        raw_ref = parse_obsidian_image_target(match.group(1))
+        # Obsidian 也能嵌入笔记、音频等非图片文件；这里只把图片嵌入作为题图来源。
+        if Path(unquote(raw_ref)).suffix.lower() in IMAGE_SUFFIXES:
+            matches.append((match.start(), raw_ref))
+    for _, raw_ref in sorted(matches, key=lambda item: item[0]):
+        if raw_ref:
+            yield raw_ref
+
+
 def resolve_image_reference(note_path: Path, raw_ref: str) -> Path | None:
     decoded = unquote(raw_ref.strip())
     if not decoded or decoded.startswith(("http://", "https://", "data:")):
@@ -426,8 +452,7 @@ def parse_note_images(
             heading_stack = [item for item in heading_stack if item[0] < level]
             heading_stack.append((level, title))
 
-        for image_match in IMAGE_RE.finditer(line):
-            raw_ref = parse_image_target(image_match.group(1))
+        for raw_ref in iter_image_targets(line):
             image_path = resolve_image_reference(note_path, raw_ref)
             key = (relative_repo_path(note_path), relative_repo_path(image_path)) if image_path else (
                 relative_repo_path(note_path), raw_ref
@@ -572,14 +597,16 @@ def build_subject_bundle(
     return SubjectBundle(subject, subject_changed, sources, problems, note_texts)
 
 
-def markdown_target(path: Path, report_path: Path) -> str:
-    relative = os.path.relpath(path, report_path.parent).replace("\\", "/")
-    return relative
+def obsidian_target(path: Path) -> str:
+    """返回 Obsidian 从仓库根目录解析的内部链接路径。"""
+    return relative_repo_path(path)
 
 
-def markdown_link(label: str, target: str) -> str:
-    wrapped = f"<{target}>" if any(char in target for char in " ()") else target
-    return f"[{label}]({wrapped})"
+def obsidian_link(label: str | None, target: str) -> str:
+    """生成可跳转且可进入 Obsidian 关系图谱的内部链接。"""
+    if label is None:
+        return f"[[{target}]]"
+    return f"[[{target}|{label}]]"
 
 
 def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
@@ -589,16 +616,16 @@ def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
     ]
     for source in bundle.sources:
         if source.image_path and source.image_path.exists():
-            image_cell = markdown_link(
-                f"{source.source_id} 题图",
-                markdown_target(source.image_path, report_path),
+            image_cell = obsidian_link(
+                None,
+                obsidian_target(source.image_path),
             )
         else:
             image_cell = source.raw_image_ref or "未解析"
         if source.note_path and source.note_path.exists():
-            note_cell = markdown_link(
-                "打开笔记",
-                markdown_target(source.note_path, report_path),
+            note_cell = obsidian_link(
+                None,
+                obsidian_target(source.note_path),
             )
         else:
             note_cell = "—"
@@ -896,18 +923,26 @@ def split_weekly_output(value: str) -> tuple[str, str, str]:
 
 
 def link_source_ids(value: str, bundle: SubjectBundle, report_path: Path) -> str:
-    """将 AI 输出中的裸来源编号变为指向题图的链接。"""
+    """将 AI 输出中的裸来源编号变为指向题图的 Obsidian 内部链接。"""
     result = value
     for source in reversed(bundle.sources):
         target = source.image_path or source.note_path
         if not target:
             continue
-        link = markdown_target(target, report_path)
-        replacement = f"[{source.source_id}]({link})"
+        link = obsidian_target(target)
+        def replace_source_id(match: re.Match[str]) -> str:
+            line_start = result.rfind("\n", 0, match.start()) + 1
+            line_end = result.find("\n", match.start())
+            if line_end < 0:
+                line_end = len(result)
+            in_table_row = result[line_start:line_end].lstrip().startswith("|")
+            label = None if in_table_row else source.source_id
+            return obsidian_link(label, link)
+
         pattern = re.compile(
-            rf"(?<!\[){re.escape(source.source_id)}(?!\]\()"
+            rf"(?<!\[){re.escape(source.source_id)}(?!\])"
         )
-        result = pattern.sub(replacement, result)
+        result = pattern.sub(replace_source_id, result)
     return result
 
 
