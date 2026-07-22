@@ -17,7 +17,7 @@ import sys
 import textwrap
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote
@@ -44,6 +44,9 @@ IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]*)\)")
 OBSIDIAN_IMAGE_RE = re.compile(r"!\[\[([^\]\r\n]+)\]\]")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 SOURCE_ID_RE = re.compile(r"\bS\d{3}\b")
+DIFF_HUNK_RE = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
+)
 WEEKDAY_NUMBERS = {
     "monday": 0,
     "tuesday": 1,
@@ -101,6 +104,8 @@ class Source:
     raw_image_ref: str | None = None
     headings: list[str] = field(default_factory=list)
     context: str = ""
+    change_kind: str = "题目"
+    line_number: int | None = None
 
     @property
     def title(self) -> str:
@@ -120,6 +125,16 @@ class SubjectBundle:
     sources: list[Source]
     problems: list[str]
     note_texts: dict[Path, str]
+
+
+@dataclass
+class NoteDelta:
+    """某个 Markdown 在本次 Git 范围内的新增/修改行。"""
+
+    relative_path: str
+    line_ranges: list[tuple[int, int]]
+    content: str | None
+    revision: str
 
 
 def load_dotenv(path: Path = ENV_PATH) -> None:
@@ -264,6 +279,92 @@ def read_commits() -> list[Commit]:
         sha, committed_at, message = fields
         commits.append(Commit(sha, parse_git_datetime(committed_at), message))
     return commits
+
+
+def parent_commit_sha(commit_sha: str) -> str:
+    """返回提交的第一个父提交；根提交使用 Git 的空树对象。"""
+    output = run_git("rev-list", "--parents", "-n", "1", commit_sha).strip()
+    fields = output.split()
+    if len(fields) >= 2:
+        return fields[1]
+    if fields and fields[0] == commit_sha:
+        return "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    raise WorkflowError(f"无法确定提交 `{commit_sha}` 的父提交。")
+
+
+def read_git_file(commit_sha: str, relative_path: str) -> str:
+    """读取指定提交中的 UTF-8 文本文件。"""
+    return run_git(
+        "-c",
+        "core.quotePath=false",
+        "show",
+        f"{commit_sha}:{normalize_repo_path(relative_path)}",
+    )
+
+
+def parse_diff_new_line_ranges(diff_text: str) -> list[tuple[int, int]]:
+    """解析 unified diff 中对应新文件的行范围。"""
+    ranges: list[tuple[int, int]] = []
+    for line in diff_text.splitlines():
+        match = DIFF_HUNK_RE.match(line)
+        if not match:
+            continue
+        start = int(match.group("new_start"))
+        count = int(match.group("new_count") or "1")
+        if count > 0:
+            ranges.append((start, start + count - 1))
+    return merge_line_ranges(ranges)
+
+
+def merge_line_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """合并重叠或相邻的行范围，避免同一变更被重复处理。"""
+    ordered = sorted((start, end) for start, end in ranges if start <= end)
+    if not ordered:
+        return []
+    merged: list[list[int]] = [[ordered[0][0], ordered[0][1]]]
+    for start, end in ordered[1:]:
+        previous = merged[-1]
+        if start <= previous[1] + 1:
+            previous[1] = max(previous[1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def note_deltas_for_scope(
+    commits: Iterable[Commit], changed_paths: dict[str, set[str]]
+) -> dict[str, NoteDelta]:
+    """以本次范围的首个父提交为基线，提取各 Markdown 的净新增内容。"""
+    ordered_commits = sorted(commits, key=lambda commit: commit.committed_at)
+    if not ordered_commits:
+        return {}
+
+    base_sha = parent_commit_sha(ordered_commits[0].sha)
+    tip_sha = ordered_commits[-1].sha
+    deltas: dict[str, NoteDelta] = {}
+    for relative_path in sorted(changed_paths):
+        if not relative_path.lower().endswith(".md"):
+            continue
+        diff_text = run_git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "--unified=0",
+            "--find-renames",
+            "--find-copies",
+            base_sha,
+            tip_sha,
+            "--",
+            relative_path,
+        )
+        ranges = parse_diff_new_line_ranges(diff_text)
+        try:
+            content = read_git_file(tip_sha, relative_path)
+        except WorkflowError:
+            content = None
+        deltas[relative_path] = NoteDelta(relative_path, ranges, content, tip_sha)
+    return deltas
 
 
 def is_allowed_message(message: str) -> bool:
@@ -435,9 +536,10 @@ def resolve_image_reference(note_path: Path, raw_ref: str) -> Path | None:
 
 
 def parse_note_images(
-    note_path: Path, subject: str
+    note_path: Path, subject: str, content: str | None = None
 ) -> tuple[str, list[Source], list[str]]:
-    content = note_path.read_text(encoding="utf-8", errors="replace")
+    if content is None:
+        content = note_path.read_text(encoding="utf-8", errors="replace")
     lines = content.splitlines()
     heading_stack: list[tuple[int, str]] = []
     sources: list[Source] = []
@@ -476,10 +578,201 @@ def parse_note_images(
                     raw_image_ref=raw_ref,
                     headings=[title for _, title in heading_stack],
                     context=context,
+                    line_number=line_number + 1,
                 )
             )
 
     return content, sources, problems
+
+
+def line_in_ranges(line_number: int | None, ranges: Iterable[tuple[int, int]]) -> bool:
+    if line_number is None:
+        return False
+    return any(start <= line_number <= end for start, end in ranges)
+
+
+def changed_context(
+    content: str,
+    line_ranges: list[tuple[int, int]],
+    anchor_line: int | None = None,
+) -> str:
+    """返回变更行及必要的标题/锚点上下文，不返回 Markdown 全文。"""
+    lines = content.splitlines()
+    if not lines or not line_ranges:
+        return ""
+
+    if anchor_line is not None:
+        containing = [
+            line_range
+            for line_range in line_ranges
+            if line_range[0] <= anchor_line <= line_range[1]
+        ]
+        if containing:
+            related_ranges = containing
+        elif len(line_ranges) > 1:
+            related_ranges = line_ranges
+        else:
+            related_ranges = [
+                min(
+                    line_ranges,
+                    key=lambda line_range: min(
+                        abs(anchor_line - line_range[0]), abs(anchor_line - line_range[1])
+                    ),
+                )
+            ]
+    else:
+        related_ranges = line_ranges
+
+    start = min(line_range[0] for line_range in related_ranges)
+    end = max(line_range[1] for line_range in related_ranges)
+
+    # 少量变更后的邻近行用于保留题图说明或变更后的下一行文字；
+    # 变更前不直接带入旧正文，避免把同一文件的历史题目重新交给 AI。
+    selected_indices: set[int] = set()
+    local_end = min(len(lines), end + 3)
+    for index in range(max(1, start), local_end + 1):
+        selected_indices.add(index - 1)
+
+    if anchor_line is not None and not any(
+        line_range[0] <= anchor_line <= line_range[1]
+        for line_range in related_ranges
+    ):
+        # 文字补充关联已有题图时，仅保留题图锚点本身和新增文字，不带入两者之间的旧总结。
+        selected_indices.add(anchor_line - 1)
+
+    first_selected_line = min(
+        [index + 1 for index in selected_indices] or [start]
+    )
+    # 补上最近的 ##/### 标题层级；#### 题目/总结会随变更片段本身提供。
+    heading_indices: list[int] = []
+    for index in range(first_selected_line - 2, -1, -1):
+        heading = HEADING_RE.match(lines[index])
+        if heading and len(heading.group(1)) <= 3:
+            heading_indices.append(index)
+            if len(heading_indices) >= 3:
+                break
+    selected_indices.update(heading_indices)
+
+    return "\n".join(lines[index] for index in sorted(selected_indices)).strip()
+
+
+def source_key(source: Source) -> tuple[str, str]:
+    return (
+        relative_repo_path(source.image_path) if source.image_path else "",
+        source.raw_image_ref or "",
+    )
+
+
+def incremental_note_sources(
+    note_path: Path,
+    subject: str,
+    content: str,
+    line_ranges: list[tuple[int, int]],
+) -> tuple[list[Source], list[str]]:
+    """从 Markdown 的 Git 新行范围中构造本次增量来源。"""
+    if not line_ranges:
+        return [], []
+
+    content_lines = content.splitlines()
+    line_ranges = [
+        line_range
+        for line_range in line_ranges
+        if any(
+            content_lines[index - 1].strip()
+            for index in range(line_range[0], min(line_range[1], len(content_lines)) + 1)
+            if index >= 1
+        )
+    ]
+    if not line_ranges:
+        return [], []
+
+    _, all_sources, problems = parse_note_images(note_path, subject, content)
+    result: list[Source] = []
+    covered_range_indexes: set[int] = set()
+
+    for source in all_sources:
+        if source.line_number is None:
+            continue
+        matching_indexes = [
+            index
+            for index, line_range in enumerate(line_ranges)
+            if line_range[0] <= source.line_number <= line_range[1]
+        ]
+        if not matching_indexes:
+            continue
+        range_index = matching_indexes[0]
+        covered_range_indexes.add(range_index)
+        result.append(
+            replace(
+                source,
+                context=changed_context(
+                    content, [line_ranges[range_index]], source.line_number
+                ),
+                change_kind="新增题目",
+            )
+        )
+
+    uncovered_ranges = [
+        line_range
+        for index, line_range in enumerate(line_ranges)
+        if index not in covered_range_indexes
+    ]
+    if not uncovered_ranges:
+        return result, problems
+
+    # 修改已有题目的总结时，尽量把增量片段关联到最近的已有题图；
+    # 如果距离过远或本文件没有题图，则保留为纯 Markdown 来源。
+    grouped_updates: dict[tuple[str, str], tuple[Source, list[tuple[int, int]]]] = {}
+    unlinked_ranges: list[tuple[int, int]] = []
+    for line_range in uncovered_ranges:
+        nearest: Source | None = None
+        if all_sources:
+            nearest = min(
+                all_sources,
+                key=lambda source: abs(
+                    (source.line_number or line_range[0]) - line_range[0]
+                ),
+            )
+            distance = abs((nearest.line_number or line_range[0]) - line_range[0])
+            if distance > 80:
+                nearest = None
+
+        if nearest is None:
+            unlinked_ranges.append(line_range)
+            continue
+
+        key = source_key(nearest)
+        if key not in grouped_updates:
+            grouped_updates[key] = (nearest, [])
+        grouped_updates[key][1].append(line_range)
+
+    if unlinked_ranges:
+        result.append(
+            Source(
+                source_id="",
+                subject=subject,
+                note_path=note_path,
+                context=changed_context(content, unlinked_ranges),
+                change_kind="笔记新增/修改",
+            )
+        )
+
+    for nearest, update_ranges in grouped_updates.values():
+        new_source = replace(
+            nearest,
+            context=changed_context(content, update_ranges, nearest.line_number),
+            change_kind="笔记新增/修改（关联已有题图）",
+        )
+        existing = next(
+            (source for source in result if source_key(source) == source_key(new_source)),
+            None,
+        )
+        if existing is None:
+            result.append(new_source)
+        elif new_source.context and new_source.context not in existing.context:
+            existing.context = f"{existing.context}\n\n---\n\n{new_source.context}"
+
+    return result, problems
 
 
 def build_subject_bundle(
@@ -487,6 +780,7 @@ def build_subject_bundle(
     changed_paths: dict[str, set[str]],
     configured_path: str,
     dirty_paths: set[str] | None = None,
+    commits: Iterable[Commit] | None = None,
 ) -> SubjectBundle:
     prefix = configured_path.replace("\\", "/").strip("/")
     dirty_paths = {normalize_repo_path(path) for path in (dirty_paths or set())}
@@ -500,6 +794,7 @@ def build_subject_bundle(
     note_texts: dict[Path, str] = {}
     seen_image_paths: set[Path] = set()
     changed_images: list[Path] = []
+    note_deltas = note_deltas_for_scope(commits, changed_paths) if commits else {}
 
     for relative_path in subject_changed:
         path = repo_path(relative_path)
@@ -518,17 +813,36 @@ def build_subject_bundle(
         if not note_path.exists():
             problems.append(f"提交中涉及的 Markdown 当前不存在：`{relative_path}`")
             continue
-        content, note_sources, note_problems = parse_note_images(note_path, subject)
+        if commits is not None:
+            delta = note_deltas.get(relative_path)
+            if delta is None or delta.content is None:
+                problems.append(
+                    f"无法读取提交范围内的 Markdown 内容：`{relative_path}`；本次未纳入来源。"
+                )
+                continue
+            content = delta.content
+            note_sources, note_problems = incremental_note_sources(
+                note_path, subject, content, delta.line_ranges
+            )
+            if not delta.line_ranges:
+                statuses = ", ".join(sorted(changed_paths.get(relative_path, set())))
+                problems.append(
+                    f"Markdown `{relative_path}` 在本次范围内没有可提取的新增行"
+                    f"（变更状态：{statuses or '未知'}）；未计为新增题目。"
+                )
+        else:
+            content, note_sources, note_problems = parse_note_images(note_path, subject)
         note_texts[note_path] = content
         sources.extend(note_sources)
         problems.extend(note_problems)
-        if not note_sources:
+        if not note_sources and commits is None:
             sources.append(
                 Source(
                     source_id="",
                     subject=subject,
                     note_path=note_path,
                     context=content[:4000],
+                    change_kind="已有笔记",
                 )
             )
 
@@ -573,6 +887,7 @@ def build_subject_bundle(
                 subject=subject,
                 image_path=image_path,
                 context="该题图在统计范围内被新增或修改，但当前未在本次变更的 Markdown 中找到对应引用。",
+                change_kind="题图新增/修改",
             )
         )
         problems.append(
@@ -611,8 +926,8 @@ def obsidian_link(label: str | None, target: str) -> str:
 
 def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
     rows = [
-        "| 编号 | 题图 | 归纳笔记 | 知识点/题型位置 |",
-        "|---|---|---|---|",
+        "| 编号 | 变更类型 | 题图 | 归纳笔记 | 知识点/题型位置 |",
+        "|---|---|---|---|---|",
     ]
     for source in bundle.sources:
         if source.image_path and source.image_path.exists():
@@ -630,34 +945,28 @@ def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
         else:
             note_cell = "—"
         title = source.title.replace("|", "\\|")
-        rows.append(f"| {source.source_id} | {image_cell} | {note_cell} | {title} |")
+        change_kind = source.change_kind.replace("|", "\\|")
+        rows.append(
+            f"| {source.source_id} | {change_kind} | {image_cell} | {note_cell} | {title} |"
+        )
     return "\n".join(rows)
 
 
 def source_payload(bundle: SubjectBundle) -> str:
     parts: list[str] = []
-    seen_notes: set[Path] = set()
     for source in bundle.sources:
         parts.append(f"### {source.source_id}")
         parts.append(f"- 科目：{source.subject}")
+        parts.append(f"- 变更类型：{source.change_kind}")
         parts.append(f"- 题图仓库路径：{relative_repo_path(source.image_path) if source.image_path else '未解析'}")
         parts.append(f"- Markdown 路径：{relative_repo_path(source.note_path) if source.note_path else '无'}")
         parts.append(f"- 知识点/题型位置：{source.title}")
         if source.context:
-            parts.append("- 题图附近笔记片段：")
+            parts.append("- 本次 Git 新增/修改片段：")
             parts.append("```markdown")
             parts.append(source.context[:4000])
             parts.append("```")
         parts.append("")
-
-        if source.note_path and source.note_path not in seen_notes:
-            seen_notes.add(source.note_path)
-            content = bundle.note_texts.get(source.note_path, "")
-            parts.append(f"### Markdown 全文：{relative_repo_path(source.note_path)}")
-            parts.append("```markdown")
-            parts.append(content[:16000])
-            parts.append("```")
-            parts.append("")
     return "\n".join(parts)
 
 
@@ -693,14 +1002,16 @@ def format_changed_files(changed_paths: dict[str, set[str]]) -> str:
 def daily_prompt(bundle: SubjectBundle, target_date: dt.date, config: dict[str, Any]) -> str:
     return textwrap.dedent(
         f"""
-        你是考研错题整理助理。请根据下面的 {bundle.subject} 科目 Markdown 笔记和题目图片，生成一段中文 Markdown 归纳，服务于 {target_date.isoformat()} 的每日复盘。
+        你是考研错题整理助理。请根据下面 Git 差异提取出的 {bundle.subject} 科目新增/修改片段和题目图片，生成一段中文 Markdown 归纳，服务于 {target_date.isoformat()} 的每日复盘。
 
         严格规则：
-        1. 只使用输入中的题图和 Markdown；不能臆造手写草稿、答案或未提供的推导。
-        2. 只总结知识点、题型、使用的方法和特殊注意事项，不代写完整解题过程。
-        3. 合并重复内容，但不要漏掉本次资料体现的题型和方法。
-        4. 每一条重要判断后标注来源编号，例如“（来源：S001、S002）”，只能使用输入中存在的编号。
-        5. 只输出以下结构之后的内容，不要输出开场白：
+        1. 输入资料已经是本次 Git 提取出的新增或修改内容；只归纳这些片段，不要根据 Markdown 路径或题图自行补回同一文件中的历史题目。
+        2. 只使用输入中的题图和 Markdown；不能臆造手写草稿、答案或未提供的推导。
+        3. 只总结知识点、题型、使用的方法和特殊注意事项，不代写完整解题过程。
+        4. 对“新增题目”来源归纳本次新题；对“笔记新增/修改（关联已有题图）”来源，只归纳新增/修改的文字，并明确这是对已有题目的补充或复盘，不要把整道历史题重新归纳一遍。
+        5. 合并重复内容，但不要漏掉本次资料体现的题型和方法。
+        6. 每一条重要判断后标注来源编号，例如“（来源：S001、S002）”，只能使用输入中存在的编号。
+        7. 只输出以下结构之后的内容，不要输出开场白：
 
         ## 知识点与题型
         - 按知识点或题型归纳，每条带来源编号。
@@ -730,16 +1041,18 @@ def weekly_prompt(
     original_count = questions - variant_count
     return textwrap.dedent(
         f"""
-        你是考研周测命题与错题归纳助理。请只根据下面的 {bundle.subject} 科目资料，覆盖北京时间 {start.strftime('%Y-%m-%d %H:%M')} 至 {end.strftime('%Y-%m-%d %H:%M')} 期间提交的错题笔记，生成周测和过去一周的题型/方法总结。
+        你是考研周测命题与错题归纳助理。请只根据下面 Git 差异提取出的 {bundle.subject} 科目新增/修改片段，覆盖北京时间 {start.strftime('%Y-%m-%d %H:%M')} 至 {end.strftime('%Y-%m-%d %H:%M')} 期间提交的错题笔记，生成周测和过去一周的题型/方法总结。
 
         严格规则：
-        1. 题目内容只能来自输入的 Markdown 和题图；不得引入输入之外的知识、公式结论或手写草稿内容。
-        2. 先总结过去一周遇到并被归纳的全部主要题型和方法；同类内容合并，每一类必须带来源编号。
-        3. 共生成约 {questions} 道题，目标为 {original_count} 道原题改编/直接复现、{variant_count} 道变式题。每题标注“原题”或“变式”，并带至少一个来源编号。
-        4. 数学和 408 已经分开处理，本次只输出 {bundle.subject}，不要混入其他科目。
-        5. 测试题部分不能出现答案；答案和核验依据必须只放在 ANSWER 标签中。
-        6. 对题图文字无法辨认、原笔记缺少答案或变式无法可靠推出的地方，明确写“待确认”，不要猜测。
-        7. 必须严格使用以下标签，标签名称和顺序不要改变；标签内部使用中文 Markdown：
+        1. 输入资料已经是本周 Git 提取出的新增或修改内容；不得根据 Markdown 路径或题图自行补回同一文件中的历史题目。
+        2. 题目内容只能来自输入的 Markdown 和题图；不得引入输入之外的知识、公式结论或手写草稿内容。
+        3. 先总结本周新增或修改内容体现的主要题型和方法；同类内容合并，每一类必须带来源编号。
+        4. 对“笔记新增/修改（关联已有题图）”来源，只使用变更片段中的文字，不要把历史题目当作本周新题重复出题。
+        5. 共生成约 {questions} 道题，目标为 {original_count} 道原题改编/直接复现、{variant_count} 道变式题。每题标注“原题”或“变式”，并带至少一个来源编号。
+        6. 数学和 408 已经分开处理，本次只输出 {bundle.subject}，不要混入其他科目。
+        7. 测试题部分不能出现答案；答案和核验依据必须只放在 ANSWER 标签中。
+        8. 对题图文字无法辨认、原笔记缺少答案或变式无法可靠推出的地方，明确写“待确认”，不要猜测。
+        9. 必须严格使用以下标签，标签名称和顺序不要改变；标签内部使用中文 Markdown：
 
         <SUMMARY>
         ## 过去一周总结
@@ -1094,11 +1407,17 @@ def daily_report(
         lines.append("本日没有可统计的 daily 提交，因此不调用 AI，不生成题目归纳。")
     else:
         for subject, configured_path in subjects.items():
-            bundle = build_subject_bundle(subject, changed, configured_path, dirty_paths)
+            bundle = build_subject_bundle(
+                subject,
+                changed,
+                configured_path,
+                dirty_paths,
+                commits=daily_commits,
+            )
             lines.append(f"### {subject}")
             lines.append("")
             lines.append(
-                f"- 变更文件：{len(bundle.changed_paths)} 个；来源题目：{len(bundle.sources)} 个。"
+                f"- 变更文件：{len(bundle.changed_paths)} 个；增量来源：{len(bundle.sources)} 个。"
             )
             if bundle.problems:
                 lines.append("- 数据检查：发现以下项目需要人工确认：")
@@ -1144,7 +1463,13 @@ def weekly_report_for_subject(
     commits = read_commits()
     weekly_commits = commits_for_week(commits, start, end)
     changed = collect_changed_paths(weekly_commits)
-    bundle = build_subject_bundle(subject, changed, configured_path, dirty_paths)
+    bundle = build_subject_bundle(
+        subject,
+        changed,
+        configured_path,
+        dirty_paths,
+        commits=weekly_commits,
+    )
 
     metadata = [
         f"> 生成时间：{end.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
@@ -1304,10 +1629,12 @@ def check_workflow(target_date: dt.date | None = None, at: dt.datetime | None = 
             "subjects": {
                 subject: {
                     "sources": len(
-                        build_subject_bundle(subject, changed, path, dirty_paths).sources
+                        build_subject_bundle(
+                            subject, changed, path, dirty_paths, commits=daily
+                        ).sources
                     ),
                     "problems": build_subject_bundle(
-                        subject, changed, path, dirty_paths
+                        subject, changed, path, dirty_paths, commits=daily
                     ).problems,
                 }
                 for subject, path in config.get("subjects", {}).items()

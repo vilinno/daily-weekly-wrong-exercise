@@ -96,6 +96,106 @@ class WorkflowUnitTests(unittest.TestCase):
             "assets/题图.png",
         )
 
+    def test_parse_diff_new_line_ranges(self):
+        diff = """@@ -4,0 +5,3 @@
++### 新题
++#### 题目
++![[新题.png]]
+@@ -20 +23 @@
+-旧内容
++新内容
+@@ -30,2 +32,0 @@
+"""
+        self.assertEqual(
+            main.parse_diff_new_line_ranges(diff),
+            [(5, 7), (23, 23)],
+        )
+
+    def test_incremental_note_sources_exclude_historical_question(self):
+        with TemporaryDirectory(dir=main.ROOT) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            note_path = temporary_root / "示例.md"
+            old_image = temporary_root / "旧题.png"
+            new_image = temporary_root / "新题.png"
+            old_image.write_bytes(b"old")
+            new_image.write_bytes(b"new")
+            content = """## 矩阵
+
+### 旧题
+#### 题目
+![[旧题.png]]
+#### 总结
+旧题总结
+
+### 新题
+#### 题目
+![[新题.png]]
+#### 总结
+新题总结
+"""
+            note_path.write_text(content, encoding="utf-8")
+            new_image_line = content.splitlines().index("![[新题.png]]") + 1
+
+            sources, problems = main.incremental_note_sources(
+                note_path,
+                "数学",
+                content,
+                [(new_image_line, new_image_line)],
+            )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].image_path, new_image.resolve())
+        self.assertEqual(sources[0].change_kind, "新增题目")
+        self.assertIn("新题总结", sources[0].context)
+        self.assertNotIn("旧题总结", sources[0].context)
+
+    def test_incremental_note_sources_keep_text_only_update_with_existing_image(self):
+        with TemporaryDirectory(dir=main.ROOT) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            note_path = temporary_root / "示例.md"
+            image_path = temporary_root / "题图.png"
+            image_path.write_bytes(b"image")
+            content = """## 级数
+### 旧题
+#### 题目
+![[题图.png]]
+#### 总结
+原有总结
+新增复盘说明
+"""
+            note_path.write_text(content, encoding="utf-8")
+            update_line = content.splitlines().index("新增复盘说明") + 1
+
+            sources, problems = main.incremental_note_sources(
+                note_path,
+                "数学",
+                content,
+                [(update_line, update_line)],
+            )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].image_path, image_path.resolve())
+        self.assertEqual(sources[0].change_kind, "笔记新增/修改（关联已有题图）")
+        self.assertIn("新增复盘说明", sources[0].context)
+
+    def test_incremental_note_sources_ignore_whitespace_only_change(self):
+        with TemporaryDirectory(dir=main.ROOT) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            note_path = temporary_root / "示例.md"
+            note_path.write_text("## 级数\n\n", encoding="utf-8")
+
+            sources, problems = main.incremental_note_sources(
+                note_path,
+                "数学",
+                note_path.read_text(encoding="utf-8"),
+                [(2, 2)],
+            )
+
+        self.assertEqual(sources, [])
+        self.assertEqual(problems, [])
+
     def test_iter_image_targets_supports_both_markdown_syntaxes(self):
         line = "![标准图片](assets/a.png) ![[b.png|300]] ![[说明.md]]"
         self.assertEqual(
