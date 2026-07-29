@@ -2,6 +2,33 @@
 
 本目录实现每日统计、每周周测、错题复盘追踪和笔记纠错。脚本默认只读取已经提交到 Git 的内容，只生成报告，不修改题图、Markdown 或 Git 历史。
 
+## 代码结构
+
+`main.py` 只负责进入命令行程序，核心实现位于 `wrong_questions/` 包中：
+
+```text
+wrong_questions/
+├── foundation.py             # 常量、数据模型、配置校验
+├── git_store.py              # Git 提交、差异和已提交文件读取
+├── source_scanner.py         # Markdown、题图和增量来源解析
+├── review_state.py           # 复盘记录、掌握度和到期策略
+├── markdown_tools.py         # Obsidian 链接和来源索引
+├── prompts.py                # 各功能的 AI 提示词
+├── quality.py                # AI 输出门禁、二次核验和风险标记
+├── ai_client.py              # OpenAI 兼容接口客户端
+├── ai_output.py              # AI 输出分段和来源编号处理
+├── scheduling.py             # 北京时间边界和调度日期
+├── report_io.py              # 报告预览与写入
+├── daily_workflow.py         # 每日统计
+├── weekly_workflow.py        # 每周测试
+├── review_workflow.py        # 复盘追踪与掌握度测试
+├── correction_workflow.py    # 纠错候选报告
+├── checks.py                 # 只读工作流检查
+└── cli.py                    # 参数解析和命令调度
+```
+
+新增功能时优先新建独立的 `*_workflow.py`，复用底层模块，不把业务逻辑写回 `main.py` 或 `cli.py`。生产模块禁止通配符导入；`testing_api.py` 仅用于兼容单元测试，不是生产依赖。
+
 ## 已确定的规则
 
 - 时区：北京时间（`Asia/Shanghai`）。

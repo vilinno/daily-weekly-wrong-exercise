@@ -9,7 +9,7 @@ from unittest.mock import patch
 AUTOMATION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AUTOMATION_DIR))
 
-import main  # noqa: E402
+import wrong_questions.testing_api as main  # noqa: E402
 
 
 class WorkflowUnitTests(unittest.TestCase):
@@ -70,7 +70,9 @@ class WorkflowUnitTests(unittest.TestCase):
             "daily: 2026-07-21",
         )
         git_output = "M\t数学/高等数学/无穷级数.md\n"
-        with patch.object(main, "run_git", return_value=git_output) as run_git:
+        with patch.object(
+            main.git_store, "run_git", return_value=git_output
+        ) as run_git:
             self.assertEqual(
                 main.changed_paths_for_commit(commit),
                 [("M", "数学/高等数学/无穷级数.md")],
