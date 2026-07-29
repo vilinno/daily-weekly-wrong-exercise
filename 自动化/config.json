@@ -10,13 +10,26 @@
     "questions_per_subject": 10,
     "variant_ratio": 0.3
   },
+  "review": {
+    "log_path": "复盘/复盘记录.md",
+    "questions_per_subject": 8,
+    "intervals_days": {
+      "未阅读": 0,
+      "未测试": 1,
+      "薄弱": 1,
+      "部分掌握": 3,
+      "已掌握": 7
+    }
+  },
   "subjects": {
     "数学": "数学",
     "408": "408"
   },
   "reports": {
     "daily": "报告/每日",
-    "weekly": "报告/每周"
+    "weekly": "报告/每周",
+    "review": "报告/复盘",
+    "correction": "报告/纠错"
   },
   "tasks": {
     "daily_name": "每日错题-每日统计",
@@ -26,6 +39,8 @@
     "default_model": "claude-opus-4-8",
     "chat_completions_url": "",
     "max_output_tokens": 4096,
-    "timeout_seconds": 180
+    "timeout_seconds": 180,
+    "verify_reviews": true,
+    "verify_corrections": true
   }
 }

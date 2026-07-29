@@ -225,6 +225,23 @@ class WorkflowUnitTests(unittest.TestCase):
         self.assertEqual(sources[0].image_path, image_path.resolve())
         self.assertEqual(sources[0].headings, ["示例", "题目"])
 
+    def test_note_image_context_includes_summary_in_same_topic(self):
+        content = """## 大章
+### 当前题型
+#### 题目
+![[题图.png]]
+#### 总结
+这里是需要用于复盘的总结。
+### 下一题型
+#### 总结
+不应包含这里。
+"""
+
+        context = main.note_section_context(content, 4)
+
+        self.assertIn("这里是需要用于复盘的总结", context)
+        self.assertNotIn("不应包含这里", context)
+
     def test_split_weekly_output(self):
         value = """
         <SUMMARY>
@@ -244,6 +261,186 @@ class WorkflowUnitTests(unittest.TestCase):
         self.assertIn("过去一周总结", summary)
         self.assertIn("测试题", test)
         self.assertIn("答案与核验", answer)
+
+    def test_parse_review_log(self):
+        content = """# 复盘记录
+
+## 记录
+
+| 日期 | 来源 | 动作 | 结果 | 正确率 | 备注 |
+|---|---|---|---|---:|---|
+| 2026-07-20 | `数学/高等数学/无穷级数.md` | 阅读 | 完成 | | 首次阅读 |
+| 2026-07-22 | [[数学/高等数学/assets/例题.png]] | 测试 | 错误 | 50% | 忘记适用条件 |
+| 无效日期 | 数学/高等数学/无穷级数.md | 阅读 | 完成 | | |
+"""
+        entries, problems = main.parse_review_log(content)
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].target, "数学/高等数学/无穷级数.md")
+        self.assertEqual(entries[1].score, 50)
+        self.assertTrue(any("日期无效" in problem for problem in problems))
+
+    def test_review_status_uses_note_level_history_and_test_score(self):
+        note = main.ROOT / "数学" / "高等数学" / "无穷级数.md"
+        image = main.ROOT / "数学" / "高等数学" / "assets" / "例题.png"
+        source = main.Source(
+            source_id="S001",
+            subject="数学",
+            note_path=note,
+            image_path=image,
+            headings=["幂级数", "收敛域"],
+        )
+        bundle = main.SubjectBundle("数学", [], [source], [], {})
+        entries = [
+            main.ReviewEntry(
+                date(2026, 7, 20),
+                "数学/高等数学/无穷级数.md",
+                "阅读",
+                "完成",
+            ),
+            main.ReviewEntry(
+                date(2026, 7, 22),
+                "数学/高等数学/assets/例题.png",
+                "测试",
+                "错误",
+                50,
+            ),
+        ]
+
+        statuses = main.build_review_statuses(
+            bundle, entries, date(2026, 7, 29), main.load_config()
+        )
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0].mastery, "薄弱")
+        self.assertEqual(statuses[0].last_read, date(2026, 7, 20))
+        self.assertEqual(statuses[0].last_test, date(2026, 7, 22))
+        self.assertEqual(statuses[0].due_on, date(2026, 7, 23))
+
+    def test_review_selection_prioritizes_due_weak_source(self):
+        weak = main.Source("S001", "数学", headings=["薄弱题"])
+        mastered = main.Source("S002", "数学", headings=["已掌握题"])
+        bundle = main.SubjectBundle("数学", [], [mastered, weak], [], {})
+        statuses = [
+            main.ReviewStatus(
+                source=mastered,
+                entries=[],
+                last_read=date(2026, 7, 28),
+                last_review=None,
+                last_test=date(2026, 7, 28),
+                mastery="已掌握",
+                due_on=date(2026, 8, 4),
+            ),
+            main.ReviewStatus(
+                source=weak,
+                entries=[],
+                last_read=date(2026, 7, 20),
+                last_review=None,
+                last_test=date(2026, 7, 20),
+                mastery="薄弱",
+                due_on=date(2026, 7, 21),
+            ),
+        ]
+
+        selected = main.select_review_sources(
+            bundle, statuses, date(2026, 7, 29), limit=1
+        )
+
+        self.assertEqual([source.source_id for source in selected.sources], ["S001"])
+
+    def test_split_review_output(self):
+        value = """
+        <TEST>
+        ## 掌握度测试
+        1. 检查题（来源：S001）
+        </TEST>
+        <ANSWER>
+        ## 答案与核验
+        1. 核验要点
+        </ANSWER>
+        """
+
+        test, answer = main.split_review_output(value)
+
+        self.assertIn("掌握度测试", test)
+        self.assertIn("答案与核验", answer)
+
+    def test_review_quality_rejects_choice_answer_without_options(self):
+        test = """## 掌握度测试
+1. 下列哪些向量组等价？（来源：S001）
+"""
+        answer = """## 答案与核验
+1. 答案为 D。（来源：S001）
+"""
+
+        issues = main.review_output_quality_issues(
+            test, answer, {"S001"}, expected_questions=1
+        )
+
+        self.assertTrue(any("没有完整列出选项" in issue for issue in issues))
+        self.assertTrue(any("给出了选项字母" in issue for issue in issues))
+
+    def test_review_quality_accepts_complete_open_question(self):
+        test = """## 掌握度测试
+1. 说明向量组等价的定义。（来源：S001）
+"""
+        answer = """## 答案与核验
+1. 两个向量组可以互相线性表示。（来源：S001）
+"""
+
+        issues = main.review_output_quality_issues(
+            test, answer, {"S001"}, expected_questions=1
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_remove_incomplete_choice_from_verified_review(self):
+        test = """## 掌握度测试
+1. 完整开放题。（来源：S001）
+
+2. 下列哪些说法正确？（来源：S002）
+"""
+        answer = """## 答案与核验
+1. 开放题答案。（来源：S001）
+
+2. 答案为 A。（来源：S002）
+"""
+        issues = main.review_output_quality_issues(
+            test, answer, {"S001", "S002"}, expected_questions=2
+        )
+        removable = main.removable_incomplete_choice_numbers(issues)
+
+        cleaned_test = main.remove_numbered_markdown_items(test, removable)
+        cleaned_answer = main.remove_numbered_markdown_items(answer, removable)
+
+        self.assertEqual(removable, {2})
+        self.assertIn("完整开放题", cleaned_test)
+        self.assertNotIn("下列哪些", cleaned_test)
+        self.assertNotIn("答案为 A", cleaned_answer)
+
+    def test_numbered_note_content_uses_one_based_line_numbers(self):
+        self.assertEqual(
+            main.numbered_note_content("第一行\n第二行"),
+            "0001: 第一行\n0002: 第二行",
+        )
+
+    def test_correction_output_is_marked_as_unverified(self):
+        value = """## 审校结论
+存在问题。
+
+## 确定错误
+| 严重程度 | 位置 |
+
+## 表述不严谨
+无。
+"""
+
+        marked = main.mark_correction_as_unverified(value)
+
+        self.assertIn("质量边界", marked)
+        self.assertIn("## AI 候选错误（待人工确认）", marked)
+        self.assertIn("## AI 候选不严谨（待人工确认）", marked)
+        self.assertNotIn("## 确定错误", marked)
 
     def test_chat_endpoint_from_base_url(self):
         old_base = main.os.environ.get("OPENAI_BASE_URL")
