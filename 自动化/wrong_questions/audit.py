@@ -123,7 +123,11 @@ def audit_markdown_references(note_path: Path, content: str) -> list[AuditFindin
             try:
                 resolve_repo_image(
                     raw_ref,
-                    base_dirs=(note_path.parent, note_path.parent / "assets"),
+                    base_dirs=(
+                        note_path.parent,
+                        note_path.parent / "assets",
+                        note_path.parent.parent / "assets",
+                    ),
                     unique_basename_fallback=True,
                 )
             except WorkflowError as exc:
@@ -150,9 +154,33 @@ def _subject_map(config: dict[str, Any]) -> dict[str, str]:
 
 def _subject_roots(config: dict[str, Any], root: Path) -> dict[str, Path]:
     return {
-        subject: (root / Path(configured.replace("/", "\\"))).resolve()
+        subject: (root / Path(*configured.replace("\\", "/").strip("/").split("/"))).resolve()
         for subject, configured in _subject_map(config).items()
     }
+
+
+def _configured_report_roots(config: dict[str, Any], root: Path) -> dict[str, Path]:
+    reports = config.get("reports", {})
+    return {
+        str(key): (root / Path(*str(value).replace("\\", "/").strip("/").split("/"))).resolve()
+        for key, value in reports.items()
+        if value
+    }
+
+
+def _question_section_has_source(content: str, heading_line: int, heading_level: int) -> bool:
+    lines = content.splitlines()
+    start = heading_line
+    boundary = len(lines)
+    for index in range(start, len(lines)):
+        match = HEADING_RE.match(lines[index])
+        if match and len(match.group(1)) <= heading_level:
+            boundary = index
+            break
+    section = "\n".join(lines[start:boundary])
+    return any(iter_image_targets(INLINE_CODE_RE.sub("", section))) or bool(
+        re.search(r"(?im)question\s*id\s*[：:]\s*[Qq]-|题目\s*ID\s*[：:]\s*[Qq]-", section)
+    )
 
 
 def _image_files(subject_roots: dict[str, Path]) -> list[Path]:
@@ -222,6 +250,12 @@ def audit_repository(
         path for path in root.rglob("*.md")
         if ".git" not in path.parts and "__pycache__" not in path.parts
     ]
+    source_markdown_files = [
+        path
+        for path in markdown_files
+        if any(path == subject_root or subject_root in path.parents for subject_root in subject_roots.values())
+    ]
+    report_roots = _configured_report_roots(config, root)
     referenced_images: set[Path] = set()
     for note_path in markdown_files:
         try:
@@ -231,18 +265,31 @@ def audit_repository(
             continue
         findings.extend(audit_markdown_references(note_path, content))
         for line in content.splitlines():
+            if note_path not in source_markdown_files:
+                break
             for raw_ref in iter_image_targets(line):
                 if classify_reference(raw_ref) != "relative":
                     continue
                 try:
-                    referenced_images.add(resolve_repo_image(raw_ref, base_dirs=(note_path.parent, note_path.parent / "assets"), unique_basename_fallback=True))
+                    referenced_images.add(
+                        resolve_repo_image(
+                            raw_ref,
+                            base_dirs=(
+                                note_path.parent,
+                                note_path.parent / "assets",
+                                note_path.parent.parent / "assets",
+                            ),
+                            unique_basename_fallback=True,
+                        )
+                    )
                 except WorkflowError:
                     pass
         for line_number, line in enumerate(content.splitlines(), start=1):
             heading = HEADING_RE.match(line)
             if heading and heading.group(2).strip().startswith("题目"):
-                next_heading = next((item for item in content.splitlines()[line_number:] if HEADING_RE.match(item)), None)
-                if next_heading is None and not any("![" in item for item in content.splitlines()[line_number:]):
+                if not _question_section_has_source(
+                    content, line_number, len(heading.group(1))
+                ):
                     findings.append(_finding("question.heading_without_source", "warning", "题目标题没有发现题图来源，可能缺少 Question ID。", _relative(note_path, root), line=line_number))
 
     image_files = _image_files(subject_roots)
@@ -312,9 +359,11 @@ def audit_repository(
         findings.append(_finding("index.invalid", "error", f"Question ID 索引不可用：{exc}。", "索引/题目索引.json"))
 
     # 报告状态和未验证报告。
-    report_roots = [root / str(path).replace("/", "\\") for key, path in config.get("reports", {}).items() if key != "audit"]
-    audit_root = root / str(config.get("reports", {}).get("audit", "报告/审计")).replace("/", "\\")
-    for report_root in report_roots:
+    audit_root = report_roots.get("audit", root / Path("报告", "审计"))
+    report_metadata: dict[Path, str | None] = {}
+    for report_name, report_root in report_roots.items():
+        if report_name == "audit":
+            continue
         if not report_root.exists():
             continue
         for report_path in report_root.rglob("*"):
@@ -323,13 +372,46 @@ def audit_repository(
             if audit_root in report_path.parents:
                 continue
             try:
-                status = _report_status(report_path.read_text(encoding="utf-8", errors="replace"), report_path.suffix.lower())
+                report_text = report_path.read_text(encoding="utf-8", errors="replace")
+                status = _report_status(report_text, report_path.suffix.lower())
+                run_match = re.search(r'"run_id"\s*:\s*"([^"]+)"|run_id\s*[：:]\s*`?([^`\s]+)', report_text)
+                report_metadata[report_path] = next(
+                    (value for value in run_match.groups() if value), None
+                ) if run_match else None
             except OSError:
                 status = None
+                report_metadata[report_path] = None
             if status is None:
                 findings.append(_finding("report.unverified", "warning", "报告没有机器可读的验证状态。", _relative(report_path, root)))
             elif status != "validated":
                 findings.append(_finding("report.not_validated", "warning", f"报告状态为 `{status}`，不是 validated。", _relative(report_path, root), status=status))
+
+    report_files = set(report_metadata)
+    for report_path in sorted(report_files):
+        if report_path.name.endswith("-答案.md"):
+            question_path = report_path.with_name(report_path.name[:-len("-答案.md")] + ".md")
+        elif report_path.suffix.lower() == ".md" and report_path.name.startswith("周测-"):
+            question_path = report_path.with_name(report_path.stem + "-答案.md")
+        elif report_path.suffix.lower() == ".md" and report_path.name.startswith("复盘-"):
+            question_path = report_path.with_name(report_path.stem + "-答案.md")
+        else:
+            continue
+        if question_path not in report_files:
+            continue
+        left_run = report_metadata.get(report_path)
+        right_run = report_metadata.get(question_path)
+        if left_run and right_run and left_run != right_run:
+            findings.append(
+                _finding(
+                    "report.pair_run_mismatch",
+                    "error",
+                    "题目报告与答案报告的 run_id 不一致，疑似不是同一次成对写入。",
+                    _relative(report_path, root),
+                    paired_path=_relative(question_path, root),
+                    left_run_id=left_run,
+                    right_run_id=right_run,
+                )
+            )
 
     summary = dict(Counter(item.code for item in findings))
     if any(item.severity == "error" for item in findings):

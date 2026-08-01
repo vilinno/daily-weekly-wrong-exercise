@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import unquote
 
-from .foundation import Commit, HEADING_RE, IMAGE_RE, IMAGE_SUFFIXES, OBSIDIAN_IMAGE_RE, ROOT, Source, SubjectBundle
+from .foundation import Commit, HEADING_RE, IMAGE_RE, IMAGE_SUFFIXES, OBSIDIAN_IMAGE_RE, ROOT, Source, SubjectBundle, WorkflowError
 from .git_store import normalize_repo_path, note_deltas_for_scope, relative_repo_path, repo_path, run_git
 from .repo_paths import resolve_repo_image
 from .question_index import assign_question_ids, load_question_index
@@ -53,10 +53,14 @@ def resolve_image_reference(note_path: Path, raw_ref: str) -> Path | None:
     try:
         return resolve_repo_image(
             decoded,
-            base_dirs=(note_path.parent, note_path.parent / "assets"),
+            base_dirs=(
+                note_path.parent,
+                note_path.parent / "assets",
+                note_path.parent.parent / "assets",
+            ),
             unique_basename_fallback=True,
         )
-    except Exception:
+    except WorkflowError:
         # 扫描阶段保留可定位的 Source 与问题，真正读取图片时仍由同一安全入口拒绝。
         return None
 
@@ -459,10 +463,9 @@ def build_subject_bundle(
     for index, source in enumerate(sources, start=1):
         source.source_id = f"S{index:03d}"
     try:
-        assign_question_ids(sources, load_question_index())
-    except Exception as exc:
-        problems.append(f"题目 ID 索引暂时无法读取，已使用候选稳定 ID：{exc}")
-        assign_question_ids(sources)
+        assign_question_ids(sources, load_question_index(), problems=problems)
+    except WorkflowError as exc:
+        problems.append(f"题目 ID 索引暂时无法读取，相关来源保持待确认：{exc}")
 
     # 当前变更中存在 Markdown，但没有题图时，明确提示，不把它误判为题目已完整归档。
     for relative_path in subject_changed:
@@ -475,7 +478,7 @@ def tracked_subject_bundle(
     subject: str,
     configured_path: str,
     dirty_paths: set[str] | None = None,
-    tracked_ref: str = "HEAD",
+    tracked_ref: str = "refs/heads/main",
 ) -> SubjectBundle:
     """扫描 HEAD 中已跟踪的整科资料，用于复盘和纠错。"""
     prefix = configured_path.replace("\\", "/").strip("/")

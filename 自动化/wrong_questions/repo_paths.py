@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import ntpath
 import os
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .foundation import IMAGE_SUFFIXES, ROOT, WorkflowError
+
+
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 
 
 def _repo_root() -> Path:
@@ -102,9 +107,17 @@ def resolve_repo_image(
 
 
 def read_repo_image(path: str | Path) -> bytes:
-    """安全读取题图，并检查常见图片格式的文件头，拒绝伪装图片。"""
+    """安全读取题图，并验证真实图片结构、大小和像素上限。"""
 
     resolved = resolve_repo_file(path)
+    try:
+        file_size = resolved.stat().st_size
+    except OSError as exc:
+        raise WorkflowError(f"图片文件无法读取：`{resolved}`") from exc
+    if file_size > MAX_IMAGE_BYTES:
+        raise WorkflowError(
+            f"图片超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MiB 大小上限：`{resolved}`"
+        )
     data = resolved.read_bytes()
     suffix = resolved.suffix.lower()
     valid = (
@@ -116,6 +129,25 @@ def read_repo_image(path: str | Path) -> bytes:
     )
     if not valid:
         raise WorkflowError(f"图片文件头与扩展名不匹配：`{resolved.relative_to(_repo_root()).as_posix()}`")
+    try:
+        from PIL import Image
+        from PIL import ImageFile
+
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+        with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                raise WorkflowError(
+                    f"图片像素超过 {MAX_IMAGE_PIXELS} 上限：`{resolved}`"
+                )
+            image.verify()
+    except WorkflowError:
+        raise
+    except ImportError as exc:
+        raise WorkflowError("真实图片校验需要安装 Pillow：`python -m pip install -r Anki/requirements.txt`") from exc
+    except (OSError, ValueError) as exc:
+        raise WorkflowError(f"图片内容无法通过真实格式校验：`{resolved}`（{exc}）") from exc
     return data
 
 

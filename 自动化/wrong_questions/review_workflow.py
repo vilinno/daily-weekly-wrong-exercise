@@ -8,16 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from .foundation import ROOT, ReviewEntry, WorkflowError
-from .git_store import read_uncommitted_paths
+from .git_store import read_uncommitted_paths, resolve_commit
 from .source_scanner import tracked_subject_bundle
 from .review_state import build_review_statuses, load_review_log, review_status_table, select_review_sources
 from .markdown_tools import source_index_markdown
 from .prompts import review_prompt
-from .quality import removable_incomplete_choice_numbers, remove_numbered_markdown_items, review_output_quality_issues, review_repair_prompt, review_verification_prompt
+from .quality import answer_leakage_issues, removable_incomplete_choice_numbers, remove_numbered_markdown_items, review_output_quality_issues, review_repair_prompt, review_verification_prompt
 from .ai_client import call_openai
 from .ai_output import link_source_ids, split_review_output
 from .scheduling import current_run_time
-from .report_io import write_report_pair
+from .report_io import workflow_entry, write_report_pair
 from .run_metadata import run_metadata_block
 from .pipeline_validation import validate_generated_output
 
@@ -32,7 +32,8 @@ def review_report_for_subject(
     write: bool,
     dirty_paths: set[str],
 ) -> tuple[Path, Path]:
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
+    snapshot_commit = resolve_commit(tracked_ref)
     bundle = tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
     statuses = build_review_statuses(bundle, entries, target_date, config)
     question_limit = int(config["review"].get("questions_per_subject", 8))
@@ -52,6 +53,9 @@ def review_report_for_subject(
     question_ids = [source.question_id for source in selected.sources]
     prompts: list[str] = []
     generation_failed = False
+    independent_verified = False
+    final_quality_issues: list[str] = []
+    final_leakage_issues: list[str] = []
 
     if selected.sources and use_ai:
         try:
@@ -107,6 +111,16 @@ def review_report_for_subject(
                             "复盘题二次核验结果未通过自动质量检查："
                             + "；".join(quality_issues)
                         )
+                independent_verified = True
+            final_quality_issues = review_output_quality_issues(
+                test, answer, valid_ids, question_limit
+            )
+            final_leakage_issues = answer_leakage_issues(test, answer)
+            if final_quality_issues or final_leakage_issues:
+                raise WorkflowError(
+                    "复盘题最终结构检查未通过："
+                    + "；".join([*final_quality_issues, *final_leakage_issues])
+                )
             test = link_source_ids(test, selected, report_path)
             answer = link_source_ids(answer, selected, answer_path)
         except WorkflowError as exc:
@@ -126,17 +140,33 @@ def review_report_for_subject(
     common_metadata = [
         f"> 生成时间：{current_run_time().strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
         f"> 复盘日期：{target_date.isoformat()}",
-        "> 数据口径：读取 HEAD 中已提交的题图、笔记和复盘记录；未提交科目资料不送往外部 AI。",
+        "> 数据口径：读取 tracked_ref 指向提交中的题图、笔记和复盘记录；未提交科目资料不送往外部 AI。",
         "",
     ]
-    status = validate_generated_output(
+    validation = validate_generated_output(
         generated=bool(prompts) and not generation_failed,
         issues=problems,
         hard_failure=generation_failed,
-    ).status
+        structure_verified=bool(prompts) and not generation_failed and not final_quality_issues,
+        sources_verified=bool(prompts) and not generation_failed,
+        domain_verified=independent_verified,
+        requires_answer_pair=True,
+        answer_pair_verified=bool(prompts) and not generation_failed and not final_quality_issues,
+        answer_leakage_free=bool(prompts) and not generation_failed and not final_leakage_issues,
+    )
+    status = validation.status
+    metadata_issues = [
+        *problems,
+        *[
+            item["message"]
+            for item in validation.issues
+            if item["message"] not in problems
+        ],
+    ]
     metadata_block = run_metadata_block(
         kind="review", status=status, config=config,
-        question_ids=question_ids, prompts=prompts, issues=problems, run_id=run_id,
+        question_ids=question_ids, prompts=prompts, issues=metadata_issues, run_id=run_id,
+        snapshot_commit=snapshot_commit, scope_kind="snapshot",
     )
     question_lines = [
         f"# 错题复盘｜{subject}｜{target_date.isoformat()}",
@@ -212,6 +242,7 @@ def review_report_for_subject(
     )
     return report_path, answer_path
 
+@workflow_entry
 def review_reports(
     target_date: dt.date,
     config: dict[str, Any],
@@ -220,7 +251,7 @@ def review_reports(
     subject_filter: str | None = None,
 ) -> list[Path]:
     dirty_paths = read_uncommitted_paths()
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
     entries, log_problems = load_review_log(config, dirty_paths, tracked_ref)
     future_entries = [entry for entry in entries if entry.reviewed_on > target_date]
     if future_entries:

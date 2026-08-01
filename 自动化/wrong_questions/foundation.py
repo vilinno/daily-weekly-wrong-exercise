@@ -197,6 +197,7 @@ def validate_config(config: Any) -> dict[str, Any]:
         raise WorkflowError("配置必须同时包含 daily 和 weekly 配置。")
     if isinstance(subjects, list):
         normalized_subjects: dict[str, str] = {}
+        subject_specs: list[dict[str, Any]] = []
         for item in subjects:
             if not isinstance(item, dict) or not item.get("name") or not item.get("path"):
                 raise WorkflowError("subjects 列表中的每项必须包含 name 和 path。")
@@ -204,8 +205,10 @@ def validate_config(config: Any) -> dict[str, Any]:
             if name in normalized_subjects:
                 raise WorkflowError(f"subjects 中有重复科目：{name}")
             normalized_subjects[name] = path
+            subject_specs.append(dict(item))
         subjects = normalized_subjects
         config["subjects"] = subjects
+        config["subject_specs"] = subject_specs
     if not isinstance(subjects, dict) or not subjects:
         raise WorkflowError("subjects 必须是非空列表（兼容旧版对象映射）。")
     for subject, configured_path in subjects.items():
@@ -218,7 +221,7 @@ def validate_config(config: Any) -> dict[str, Any]:
         raise WorkflowError("配置必须包含 review 复盘配置。")
 
     git = config.get("git", {})
-    if not isinstance(git, dict) or not str(git.get("tracked_ref", "HEAD")).strip():
+    if not isinstance(git, dict) or not str(git.get("tracked_ref", "refs/heads/main")).strip():
         raise WorkflowError("git.tracked_ref 必须是非空 Git 引用。")
 
     parse_clock_time(daily.get("time"), "daily.time")

@@ -22,3 +22,32 @@ jobs:
         run: python Anki/check_anki.py
       - name: 无 API 的最小流水线验收
         run: python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run
+      - name: 周测无 API 验收
+        run: python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run
+      - name: 复盘无 API 验收
+        run: python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run
+      - name: 纠错无 API 验收
+        run: python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 运行单元测试
+        run: python -m unittest discover -s 自动化/tests -v
+      - name: 编译检查
+        run: python -m compileall -q 自动化 Anki
+      - name: 安装 Anki 构建依赖
+        run: python -m pip install -r Anki/requirements.txt
+      - name: Anki 仓库内媒体安全 fixture
+        run: python Anki/check_anki.py
+      - name: 无 API 工作流矩阵验收
+        shell: pwsh
+        run: |
+          python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run
+          python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run
+          python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run
+          python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run

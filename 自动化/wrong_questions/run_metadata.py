@@ -9,18 +9,11 @@ import json
 from typing import Any, Iterable
 
 from .foundation import WorkflowError
-from .git_store import run_git
+from .git_store import resolve_commit
 from .pipeline_validation import issue_record
 
 
-PIPELINE_VERSION = "1"
-
-
-def _revision(ref: str, suffix: str = "") -> str:
-    try:
-        return run_git("rev-parse", f"{ref}{suffix}").strip()
-    except WorkflowError:
-        return "未知"
+PIPELINE_VERSION = "2"
 
 
 def prompt_digest(prompts: Iterable[str]) -> str:
@@ -40,6 +33,11 @@ def run_metadata_block(
     prompts: Iterable[str] = (),
     issues: Iterable[str] = (),
     run_id: str | None = None,
+    base_commit: str | None = None,
+    tip_commit: str | None = None,
+    source_commits: Iterable[str] = (),
+    snapshot_commit: str | None = None,
+    scope_kind: str | None = None,
 ) -> str:
     payload = run_metadata_payload(
         kind=kind,
@@ -49,6 +47,11 @@ def run_metadata_block(
         prompts=prompts,
         issues=issues,
         run_id=run_id,
+        base_commit=base_commit,
+        tip_commit=tip_commit,
+        source_commits=source_commits,
+        snapshot_commit=snapshot_commit,
+        scope_kind=scope_kind,
     )
     display_issues = payload["issues"]
     lines = [
@@ -61,6 +64,8 @@ def run_metadata_block(
         f"- tracked_ref：`{payload['tracked_ref']}`",
         f"- base_commit：`{payload['base_commit']}`",
         f"- tip_commit：`{payload['tip_commit']}`",
+        f"- snapshot_commit：`{payload['snapshot_commit']}`",
+        f"- source_commits：`{', '.join(payload['source_commits']) if payload['source_commits'] else '无'}`",
         f"- generation_model：`{payload['generation_model']}`",
         f"- verification_model：`{payload['verification_model']}`",
         f"- prompt_version：`{payload['prompt_version']}`",
@@ -87,10 +92,17 @@ def run_metadata_payload(
     prompts: Iterable[str] = (),
     issues: Iterable[Any] = (),
     run_id: str | None = None,
+    base_commit: str | None = None,
+    tip_commit: str | None = None,
+    source_commits: Iterable[str] = (),
+    snapshot_commit: str | None = None,
+    scope_kind: str | None = None,
 ) -> dict[str, Any]:
     if status not in {"validated", "needs_review", "rejected"}:
         raise WorkflowError(f"未知流水线状态：{status}")
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    if scope_kind not in {None, "range", "snapshot"}:
+        raise WorkflowError(f"未知 Git 范围类型：{scope_kind}")
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
     ai = config.get("ai", {})
     generation_model = os.environ.get("OPENAI_MODEL", "").strip() or str(
         ai.get("default_model", "未配置")
@@ -99,17 +111,37 @@ def run_metadata_payload(
         ai.get("verify_model", generation_model)
     )
     ids = sorted({value for value in question_ids if value})
+    prompt_values = tuple(value for value in prompts if value)
+    if scope_kind == "range":
+        actual_base = base_commit
+        actual_tip = tip_commit
+        actual_snapshot = None
+    elif scope_kind == "snapshot":
+        actual_base = None
+        actual_tip = snapshot_commit or resolve_commit(tracked_ref)
+        actual_snapshot = actual_tip
+    else:
+        actual_base = base_commit
+        actual_tip = tip_commit
+        actual_snapshot = snapshot_commit
+        if actual_base is None and actual_tip is None and actual_snapshot is None:
+            actual_tip = resolve_commit(tracked_ref)
+            actual_snapshot = actual_tip
+    commits = list(dict.fromkeys(value for value in source_commits if value))
     return {
         "run_id": run_id or uuid.uuid4().hex,
         "kind": kind,
         "status": status,
         "tracked_ref": tracked_ref,
-        "base_commit": _revision(tracked_ref, "^"),
-        "tip_commit": _revision(tracked_ref),
-        "generation_model": generation_model if prompts else "未调用",
-        "verification_model": verification_model if prompts else "未调用",
+        "scope_kind": scope_kind or ("snapshot" if actual_snapshot else "range"),
+        "base_commit": actual_base,
+        "tip_commit": actual_tip,
+        "snapshot_commit": actual_snapshot,
+        "source_commits": commits,
+        "generation_model": generation_model if prompt_values else "未调用",
+        "verification_model": verification_model if prompt_values else "未调用",
         "prompt_version": config.get("pipeline", {}).get("prompt_version", "v1"),
-        "prompt_sha256": prompt_digest(prompts),
+        "prompt_sha256": prompt_digest(prompt_values),
         "question_ids": ids,
         "issues": [issue_record(issue) for issue in issues if issue],
     }

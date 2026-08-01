@@ -7,26 +7,30 @@ from pathlib import Path
 from typing import Any
 
 from .foundation import ROOT, WorkflowError
-from .git_store import collect_changed_paths, commit_local_date_issues, commits_for_daily, read_commits, read_uncommitted_paths, subject_for_path
+from .git_store import collect_changed_paths, commit_local_date_issues, commits_for_daily, parent_commit_sha, read_commits, read_uncommitted_paths, subject_for_path
 from .source_scanner import build_subject_bundle
 from .markdown_tools import format_changed_files, format_commit_list, source_index_markdown
 from .prompts import daily_prompt
 from .ai_client import call_openai
 from .ai_output import link_source_ids, source_ids_in
 from .scheduling import all_commits_in_local_day, current_run_time
-from .report_io import write_or_preview_report
+from .report_io import workflow_entry, write_or_preview_report
 from .run_metadata import run_metadata_block
 from .pipeline_validation import validate_generated_output, validate_source_ids
 
+@workflow_entry
 def daily_report(
     target_date: dt.date,
     config: dict[str, Any],
     use_ai: bool = True,
     write: bool = True,
 ) -> Path:
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
     commits = read_commits(tracked_ref)
     daily_commits = commits_for_daily(commits, target_date)
+    source_commits = [commit.sha for commit in daily_commits]
+    base_commit = parent_commit_sha(daily_commits[0].sha) if daily_commits else None
+    tip_commit = daily_commits[-1].sha if daily_commits else None
     day_commits = all_commits_in_local_day(commits, target_date)
     changed = collect_changed_paths(daily_commits)
     subjects = config.get("subjects", {})
@@ -138,15 +142,29 @@ def daily_report(
                 lines.extend(["", "#### AI 归纳", "", "> 本次使用 `--no-ai`，未调用外部 AI。"])
             lines.extend(["", "#### 来源索引", "", source_index_markdown(bundle, report_path), ""])
 
-    status = validate_generated_output(
+    validation = validate_generated_output(
         generated=bool(prompts) and not generation_failed,
         issues=pipeline_issues,
         hard_failure=generation_failed,
-    ).status
+        structure_verified=bool(prompts) and not generation_failed,
+        sources_verified=bool(prompts) and not generation_failed and not pipeline_issues,
+        domain_verified=False,
+    )
+    status = validation.status
+    metadata_issues = [
+        *pipeline_issues,
+        *[
+            item["message"]
+            for item in validation.issues
+            if item["message"] not in pipeline_issues
+        ],
+    ]
     lines.extend(
         ["", run_metadata_block(
             kind="daily", status=status, config=config,
-            question_ids=question_ids, prompts=prompts, issues=pipeline_issues,
+            question_ids=question_ids, prompts=prompts, issues=metadata_issues,
+            base_commit=base_commit, tip_commit=tip_commit,
+            source_commits=source_commits, scope_kind="range",
         ), ""]
     )
     content = "\n".join(lines).rstrip() + "\n"

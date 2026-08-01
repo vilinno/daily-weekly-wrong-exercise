@@ -26,12 +26,46 @@ def validate_generated_output(
     generated: bool,
     issues: Iterable[str] = (),
     hard_failure: bool = False,
+    structure_verified: bool = False,
+    sources_verified: bool = False,
+    domain_verified: bool = False,
+    requires_answer_pair: bool = False,
+    answer_pair_verified: bool = False,
+    answer_leakage_free: bool = False,
 ) -> ValidationResult:
-    values = tuple(issue_record(issue) for issue in issues if issue)
+    values = [issue_record(issue) for issue in issues if issue]
+    if not generated:
+        values.append(
+            issue_record(
+                "没有形成可供验证的生成结果。",
+                code="pipeline.generated_missing",
+                severity="error",
+            )
+        )
+    checks = (
+        ("structure", structure_verified, "结构检查尚未通过。"),
+        ("sources", sources_verified, "来源引用尚未完成核验。"),
+        ("domain", domain_verified, "领域内容尚未经过独立核验。"),
+    )
+    if requires_answer_pair:
+        checks += (
+            ("answer_pair", answer_pair_verified, "题目与答案尚未完成配对核验。"),
+            ("answer_leakage", answer_leakage_free, "尚未完成题目与答案泄漏检查。"),
+        )
+    for name, passed, message in checks:
+        if not passed:
+            values.append(
+                issue_record(
+                    message,
+                    code=f"pipeline.validation_{name}",
+                    severity="warning",
+                )
+            )
+    frozen_values = tuple(values)
     if hard_failure:
-        return ValidationResult("rejected", values)
-    if not generated or values:
-        return ValidationResult("needs_review", values)
+        return ValidationResult("rejected", frozen_values)
+    if frozen_values:
+        return ValidationResult("needs_review", frozen_values)
     return ValidationResult("validated", ())
 
 

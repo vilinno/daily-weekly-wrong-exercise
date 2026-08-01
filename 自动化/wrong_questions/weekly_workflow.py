@@ -8,16 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from .foundation import ROOT, WorkflowError
-from .git_store import collect_changed_paths, commits_for_week, read_commits, read_uncommitted_paths
+from .git_store import collect_changed_paths, commits_for_week, parent_commit_sha, read_commits, read_uncommitted_paths
 from .source_scanner import build_subject_bundle
 from .markdown_tools import format_commit_list, source_index_markdown
 from .prompts import weekly_prompt
 from .ai_client import call_openai
 from .ai_output import link_source_ids, source_ids_in, split_weekly_output
 
-from .report_io import write_or_preview_report, write_report_pair
+from .report_io import workflow_entry, write_or_preview_report, write_report_pair
 from .run_metadata import run_metadata_block
 from .pipeline_validation import validate_generated_output, validate_source_ids
+from .quality import answer_leakage_issues, review_output_quality_issues
 
 def weekly_report_for_subject(
     subject: str,
@@ -31,9 +32,12 @@ def weekly_report_for_subject(
     write: bool = True,
     dirty_paths: set[str] | None = None,
 ) -> tuple[Path, Path]:
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
     commits = read_commits(tracked_ref)
     weekly_commits = commits_for_week(commits, start, end)
+    source_commits = [commit.sha for commit in weekly_commits]
+    base_commit = parent_commit_sha(weekly_commits[0].sha) if weekly_commits else None
+    tip_commit = weekly_commits[-1].sha if weekly_commits else None
     changed = collect_changed_paths(weekly_commits)
     bundle = build_subject_bundle(
         subject,
@@ -62,6 +66,8 @@ def weekly_report_for_subject(
             kind="weekly", status="needs_review", config=config,
             question_ids=question_ids,
             issues=[*bundle.problems, "本周没有可用来源。"], run_id=run_id,
+            base_commit=base_commit, tip_commit=tip_commit,
+            source_commits=source_commits, scope_kind="range",
         )
         question_content = "\n".join(
             [
@@ -128,14 +134,42 @@ def weekly_report_for_subject(
         generation_failed = True
         problems.append("AI 输出没有包含来源编号，题型/方法和试题无法完成来源核验。")
 
-    status = validate_generated_output(
+    quality_issues: list[str] = []
+    leakage_issues: list[str] = []
+    if use_ai and not generation_failed:
+        expected_questions = int(config.get("weekly", {}).get("questions_per_subject", 10))
+        quality_issues = review_output_quality_issues(
+            test, answer, valid_ids, expected_questions
+        )
+        leakage_issues = answer_leakage_issues(test, answer)
+        problems.extend(quality_issues)
+        problems.extend(leakage_issues)
+
+    validation = validate_generated_output(
         generated=bool(prompts) and not generation_failed,
         issues=problems,
-        hard_failure=generation_failed,
-    ).status
+        hard_failure=generation_failed or bool(quality_issues) or bool(leakage_issues),
+        structure_verified=bool(prompts) and not generation_failed and not quality_issues,
+        sources_verified=bool(prompts) and not generation_failed and not unknown_ids and bool(used_ids),
+        domain_verified=False,
+        requires_answer_pair=True,
+        answer_pair_verified=bool(prompts) and not generation_failed and not quality_issues,
+        answer_leakage_free=bool(prompts) and not generation_failed and not leakage_issues,
+    )
+    status = validation.status
+    metadata_issues = [
+        *problems,
+        *[
+            item["message"]
+            for item in validation.issues
+            if item["message"] not in problems
+        ],
+    ]
     metadata_block = run_metadata_block(
         kind="weekly", status=status, config=config,
-        question_ids=question_ids, prompts=prompts, issues=problems, run_id=run_id,
+        question_ids=question_ids, prompts=prompts, issues=metadata_issues, run_id=run_id,
+        base_commit=base_commit, tip_commit=tip_commit,
+        source_commits=source_commits, scope_kind="range",
     )
 
     common = [
@@ -170,6 +204,7 @@ def weekly_report_for_subject(
     write_report_pair(report_path, question_content, answer_path, answer_content, write)
     return report_path, answer_path
 
+@workflow_entry
 def weekly_reports(
     end: dt.datetime,
     config: dict[str, Any],

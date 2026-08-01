@@ -1,2 +1,3 @@
 anki==26.5
 Markdown==3.8.2
+Pillow==11.3.0

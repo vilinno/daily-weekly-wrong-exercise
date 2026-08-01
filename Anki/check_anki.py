@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,7 +16,9 @@ from build_anki import ImageRef, resolve_image  # noqa: E402
 from wrong_questions.repo_paths import read_repo_image  # noqa: E402
 
 
-PNG_FIXTURE = b"\x89PNG\r\n\x1a\n" + b"fixture"
+PNG_FIXTURE = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def run_fixture() -> dict[str, object]:

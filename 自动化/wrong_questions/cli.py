@@ -7,6 +7,7 @@ import json
 import sys
 
 from .foundation import ROOT, WorkflowError, load_config, load_dotenv
+from .git_store import verify_tracked_ref
 from .daily_workflow import daily_report
 from .weekly_workflow import weekly_reports
 from .review_workflow import review_reports
@@ -29,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daily.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅生成结构检查报告")
     daily.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
+    daily.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     weekly = subparsers.add_parser("weekly", help="生成数学和 408 周测")
     weekly.add_argument("--at", help="指定周测结束时间，例如 2026-07-26T08:00:00+08:00")
@@ -39,30 +41,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     weekly.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅生成无题目占位报告")
     weekly.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
+    weekly.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     review = subparsers.add_parser("review", help="生成复盘状态、掌握度测试和独立答案")
     review.add_argument("--date", help="复盘日期：YYYY-MM-DD，默认使用北京时间当天")
     review.add_argument("--subject", help="只生成指定科目，例如数学或 408")
     review.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅生成追踪状态和结构报告")
     review.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
+    review.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     correct = subparsers.add_parser("correct", help="逐篇审校笔记并生成纠错报告")
     correct.add_argument("--date", help="报告日期：YYYY-MM-DD，默认使用北京时间当天")
     correct.add_argument("--subject", help="只检查指定科目，例如数学或 408")
     correct.add_argument("--no-ai", action="store_true", help="不调用外部 AI，仅检查笔记、题图和链接结构")
     correct.add_argument("--dry-run", action="store_true", help="生成预览到终端，不写入报告文件")
+    correct.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     check = subparsers.add_parser("check", help="只读检查 Git 和题图/笔记解析，不写入报告")
     check.add_argument("--date", help="检查指定每日日期：YYYY-MM-DD")
     check.add_argument("--at", help="检查指定周测结束时间：ISO 8601")
+    check.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     index = subparsers.add_parser("index", help="生成稳定 Question ID 索引")
     index.add_argument("--subject", help="只处理指定科目")
     index.add_argument("--dry-run", action="store_true", help="只预览，不写入索引")
+    index.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
 
     audit = subparsers.add_parser("audit", help="只读审计全仓库结构、来源和报告状态")
     audit.add_argument("--dry-run", action="store_true", help="只输出结果，不写入审计报告")
     audit.add_argument("--json", action="store_true", help="dry-run 时只输出 JSON")
+    audit.add_argument("--tracked-ref", help="覆盖配置中的生产 Git ref，例如 refs/heads/main")
     return parser
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config()
+        if args.tracked_ref:
+            config.setdefault("git", {})["tracked_ref"] = args.tracked_ref
+        verify_tracked_ref(str(config.get("git", {}).get("tracked_ref", "refs/heads/main")))
         if args.command == "daily":
             if args.date and args.scheduled:
                 raise WorkflowError("daily 不能同时使用 --date 和 --scheduled。")
@@ -139,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             target_date = parse_date(args.date) if args.date else None
             at = parse_datetime(args.at) if args.at else None
-            print(json.dumps(check_workflow(target_date, at), ensure_ascii=False, indent=2))
+            print(json.dumps(check_workflow(target_date, at, config), ensure_ascii=False, indent=2))
             return 0
         if args.command == "index":
             value, problems = generate_question_index(

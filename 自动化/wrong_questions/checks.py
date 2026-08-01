@@ -9,9 +9,13 @@ from .foundation import ROOT, load_config
 from .git_store import collect_changed_paths, commits_for_daily, commits_for_week, read_commits, read_uncommitted_paths, subject_for_path
 from .source_scanner import build_subject_bundle
 
-def check_workflow(target_date: dt.date | None = None, at: dt.datetime | None = None) -> dict[str, Any]:
-    config = load_config()
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+def check_workflow(
+    target_date: dt.date | None = None,
+    at: dt.datetime | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = config or load_config()
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
     commits = read_commits(tracked_ref)
     dirty_paths = read_uncommitted_paths()
     result: dict[str, Any] = {

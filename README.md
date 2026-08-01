@@ -76,9 +76,9 @@ docs: 简短说明
 - `review` 命令读取 `复盘/复盘记录.md`，追踪阅读、复盘、测试和掌握状态，优先对到期或薄弱错题生成测试题；题目与答案分开保存。
 - `correct` 命令逐篇结合笔记全文和原始题图审校，在纠错报告中标明位置、错误原因和建议正确说法；所有 AI 纠错均标记为待人工确认，不自动改写笔记。
 - 自动化采用分层模块结构；`自动化/main.py` 仅作为命令行入口，日报、周测、复盘和纠错分别由独立工作流模块实现。
-- `index --dry-run` 可预览稳定 Question ID、图片 SHA-256 和路径别名；确认后运行 `index` 写入 `索引/题目索引.json`。
+- `index --dry-run` 可预览待写入的持久 Question ID、图片 SHA-256 和路径别名；确认后运行 `index` 写入并提交 `索引/题目索引.json`。图片哈希不是永久 ID，冲突和未登记来源会保留为待确认。
 - `audit --dry-run --json` 执行只读全仓库审计，发现问题返回非零；默认运行会在 `报告/审计/` 保存 JSON 和 Markdown findings，不自动修复资料。
-- 每份生成物都记录 run_id、tracked_ref、base/tip commit、模型、prompt 哈希、Question ID 和 `validated`/`needs_review`/`rejected` 状态；`--no-ai` 不会伪装成已验证报告。
+- 每份生成物都记录 run_id、tracked_ref、实际 source commits 或 snapshot commit、模型、prompt 哈希、Question ID 和 `validated`/`needs_review`/`rejected` 状态；只有独立领域核验完成才会是 `validated`，`--no-ai` 不会伪装成已验证报告。
 
 自动化只生成文件，不修改原始题图和 Markdown，也不自动提交 Git。首次启用前需要配置有效的 OpenAI API 密钥，并按 [`自动化/README.md`](自动化/README.md) 注册 Windows 定时任务。
 

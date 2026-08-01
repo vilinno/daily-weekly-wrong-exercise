@@ -25,7 +25,7 @@ wrong_questions/
 ├── correction_workflow.py    # 纠错候选报告
 ├── checks.py                 # 只读工作流检查
 ├── repo_paths.py             # 仓库内路径与图片读取安全入口
-├── question_index.py         # Question ID、图片哈希和路径别名索引
+├── question_index.py         # 持久 Question ID、图片哈希和路径别名索引
 ├── run_metadata.py            # 统一流水线运行元数据与状态
 ├── pipeline_validation.py     # 统一来源验证和状态判定
 ├── audit.py                   # 全仓库只读审计与 JSON/Markdown 报告
@@ -43,10 +43,12 @@ wrong_questions/
 - 每科题量：约 10 题，目标为约 70% 原题/原题改编、30% 变式题。
 - 不读取未提交内容，不自动提交生成物。
 - 所有 Markdown、题图和 Anki 媒体必须经过仓库内安全路径入口；远程 URL、Windows 绝对路径、路径逃逸、仓库外符号链接和伪装图片会被拒绝。
+- 图片读取不仅检查文件头，还使用 Pillow 校验真实格式、文件大小和像素上限；完整构建依赖见 `Anki/requirements.txt`。
 - Git 只扫描 `config.json` 中 `git.tracked_ref` 的祖先链，不使用 `git log --all`；merge commit 不作为 daily 来源。
-- 周测、复盘题目与答案在同一运行锁内成对原子写入；单文件报告使用临时文件、fsync 和 replace。
+- 写模式工作流从收集阶段起持有独占锁，锁记录 pid、主机、启动时间和 run_id，并能识别已退出进程留下的陈旧锁；周测、复盘题目与答案先准备两个临时文件再成对替换，失败时恢复已有文件。
 - `audit` 只读扫描过渡站、Markdown 引用、路径安全、孤立/重复题图、科目目录、Question ID 索引和报告状态；发现问题返回非零并保留 JSON/Markdown findings，不自动修复资料。
 - 每份报告的运行元数据同时包含 JSON fenced block，`issues` 的每项都有 `code`、`severity`、`message`。
+- 只有结构、来源、题答配对、答案泄漏和领域独立核验全部通过时才允许状态为 `validated`；`--no-ai`、缺少独立核验或纠错候选均保持 `needs_review`，硬失败为 `rejected`。
 - 题型、方法和测试题通过 `S001` 等来源编号链接到对应题图；报告使用 Obsidian 内部链接，末尾同时提供来源索引。
 - 复盘记录由用户填写在 `复盘/复盘记录.md`；自动化只读取已提交版本，不会代替用户勾选或改写记录。
 - 纠错按篇结合 Markdown 全文和原始题图审校，只在 `报告/纠错/` 中反馈，不自动修改学习笔记。
@@ -106,7 +108,13 @@ chore: 初始化或维护说明
 fix: 修复说明
 ```
 
-每日脚本把 `daily: YYYY-MM-DD` 作为规范格式；历史兼容的 `daily:YYYY-MM-DD` 仍可解析，但会在报告中标记为不规范。`git.tracked_ref` 默认是 `HEAD`，不会扫描其他 ref。
+每日脚本把 `daily: YYYY-MM-DD` 作为规范格式；历史兼容的 `daily:YYYY-MM-DD` 仍可解析，但会在报告中标记为不规范。`git.tracked_ref` 默认是 `refs/heads/main`，启动时必须验证该 ref 存在；可用各子命令的 `--tracked-ref` 临时覆盖，不会扫描其他 ref。
+
+## Question ID 与索引
+
+Question ID 由 `index` 首次写入索引时随机生成并持久保存。图片 SHA-256、路径别名和不含行号的语义指纹只用于匹配；图片内容变化、笔记移动或路径别名变化不会直接生成新的哈希 ID。未登记、同一图片对应多个记录或一次扫描中重复图片哈希都会保留为待确认，不静默合并。
+
+首次使用 Anki 或复盘前，应先运行 `python 自动化/main.py index --dry-run` 检查问题，再运行 `python 自动化/main.py index` 并提交 `索引/题目索引.json`。没有持久索引的题图不会伪造 Question ID，Anki 会将其列入待补清单。
 
 ## 增量统计口径
 

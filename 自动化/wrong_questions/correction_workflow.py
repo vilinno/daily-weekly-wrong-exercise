@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .foundation import ROOT, Source, SubjectBundle, WorkflowError
-from .git_store import read_uncommitted_paths, relative_repo_path
+from .git_store import read_uncommitted_paths, relative_repo_path, resolve_commit
 from .source_scanner import tracked_subject_bundle
 from .markdown_tools import obsidian_link, obsidian_target, source_index_markdown
 from .prompts import correction_prompt
@@ -17,7 +17,7 @@ from .quality import correction_verification_prompt, mark_correction_as_unverifi
 from .ai_client import call_openai
 from .ai_output import link_source_ids, source_ids_in
 from .scheduling import current_run_time
-from .report_io import write_or_preview_report
+from .report_io import workflow_entry, write_or_preview_report
 from .run_metadata import run_metadata_block
 from .pipeline_validation import validate_source_ids
 from .pipeline_validation import validate_generated_output
@@ -62,7 +62,8 @@ def correction_report_for_subject(
     write: bool,
     dirty_paths: set[str],
 ) -> Path:
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
+    snapshot_commit = resolve_commit(tracked_ref)
     bundle = tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
     report_dir = ROOT / config["reports"]["correction"]
     report_path = report_dir / f"纠错报告-{target_date.isoformat()}-{subject}.md"
@@ -75,7 +76,7 @@ def correction_report_for_subject(
         f"# 笔记纠错报告｜{subject}｜{target_date.isoformat()}",
         "",
         f"> 生成时间：{current_run_time().strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
-        "> 数据口径：逐篇检查 HEAD 中已提交且工作区无未提交修改的 Markdown，并结合其引用的原始题图；报告不会自动改写笔记。",
+        "> 数据口径：逐篇检查 tracked_ref 指向提交中且工作区无未提交修改的 Markdown，并结合其引用的原始题图；报告不会自动改写笔记。",
         "",
         "## 审校范围",
         "",
@@ -147,21 +148,35 @@ def correction_report_for_subject(
                 "",
             ]
         )
-    status = validate_generated_output(
+    validation = validate_generated_output(
         generated=bool(prompts) and not generation_failed,
         issues=pipeline_issues,
         hard_failure=generation_failed,
-    ).status
+        structure_verified=bool(prompts) and not generation_failed,
+        sources_verified=bool(prompts) and not generation_failed,
+        domain_verified=False,
+    )
+    status = validation.status
+    metadata_issues = [
+        *pipeline_issues,
+        *[
+            item["message"]
+            for item in validation.issues
+            if item["message"] not in pipeline_issues
+        ],
+    ]
     lines.extend(
         ["", run_metadata_block(
             kind="correction", status=status, config=config,
             question_ids=question_ids, prompts=prompts,
-            issues=pipeline_issues, run_id=run_id,
+            issues=metadata_issues, run_id=run_id,
+            snapshot_commit=snapshot_commit, scope_kind="snapshot",
         ), ""]
     )
     write_or_preview_report(report_path, "\n".join(lines).rstrip() + "\n", write)
     return report_path
 
+@workflow_entry
 def correction_reports(
     target_date: dt.date,
     config: dict[str, Any],

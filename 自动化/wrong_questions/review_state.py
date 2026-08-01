@@ -79,7 +79,7 @@ def parse_review_log(content: str) -> tuple[list[ReviewEntry], list[str]]:
     return entries, problems
 
 def load_review_log(
-    config: dict[str, Any], dirty_paths: set[str], tracked_ref: str = "HEAD"
+    config: dict[str, Any], dirty_paths: set[str], tracked_ref: str = "refs/heads/main"
 ) -> tuple[list[ReviewEntry], list[str]]:
     relative_path = normalize_repo_path(str(config["review"]["log_path"]))
     problems: list[str] = []

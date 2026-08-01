@@ -57,9 +57,25 @@ def parse_git_datetime(value: str) -> dt.datetime:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(BEIJING)
 
-def read_commits(tracked_ref: str = "HEAD") -> list[Commit]:
+def resolve_commit(ref: str) -> str:
+    """解析并校验一个必须指向 commit 的 Git ref。"""
+
+    value = ref.strip()
+    if not value:
+        raise WorkflowError("Git ref 不能为空。")
+    return run_git("rev-parse", "--verify", f"{value}^{{commit}}").strip()
+
+
+def verify_tracked_ref(tracked_ref: str) -> str:
+    """在工作流启动时确认生产数据引用存在。"""
+
+    return resolve_commit(tracked_ref)
+
+
+def read_commits(tracked_ref: str = "refs/heads/main") -> list[Commit]:
     """只读取指定 ref 的祖先链，不扫描 --all。"""
-    ref = tracked_ref.strip() or "HEAD"
+    ref = tracked_ref.strip() or "refs/heads/main"
+    verify_tracked_ref(ref)
     output = run_git("log", ref, "--format=%H%x09%cI%x09%P%x09%s")
     commits: list[Commit] = []
     for line in output.splitlines():

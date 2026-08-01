@@ -67,6 +67,22 @@ def review_output_quality_issues(
             issues.append(f"第 {number} 题答案给出了选项字母，但题干没有选项。")
     return issues
 
+
+def answer_leakage_issues(test: str, answer: str) -> list[str]:
+    """检查测试区是否混入答案区标记；只报告高置信度结构泄漏。"""
+
+    issues: list[str] = []
+    answer_heading = re.compile(
+        r"(?im)^\s*#{1,6}\s*(?:答案|答案与核验|参考答案|解析|解答)\s*$"
+    )
+    if answer_heading.search(test):
+        issues.append("测试题正文包含答案或解析标题，疑似发生答案泄漏。")
+    if re.search(r"(?im)^\s*(?:答案|参考答案|解析)\s*[:：]", test):
+        issues.append("测试题正文包含显式答案/解析字段，疑似发生答案泄漏。")
+    if not answer.strip():
+        issues.append("答案正文为空，无法完成答案配对核验。")
+    return issues
+
 def remove_numbered_markdown_items(value: str, numbers: set[int]) -> str:
     matches = list(re.finditer(r"(?m)^\s*(?:\*\*)?(\d+)\.\s*", value))
     if not matches:

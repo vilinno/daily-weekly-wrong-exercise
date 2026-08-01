@@ -28,7 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_DIR = ROOT / "自动化"
 if str(AUTOMATION_DIR) not in sys.path:
     sys.path.insert(0, str(AUTOMATION_DIR))
-from wrong_questions.repo_paths import read_repo_image, resolve_repo_image  # noqa: E402
+from wrong_questions.foundation import WorkflowError  # noqa: E402
+from wrong_questions.repo_paths import read_repo_image, resolve_repo_file, resolve_repo_image  # noqa: E402
 from wrong_questions.question_index import load_question_index, question_id_for_image  # noqa: E402
 OUTPUT_DIR = ROOT / "Anki"
 PACKAGE_PATH = OUTPUT_DIR / "每日错题-408与数学.apkg"
@@ -37,13 +38,9 @@ ISSUES_PATH = OUTPUT_DIR / "待补清单.md"
 REPORT_PATH = OUTPUT_DIR / "构建报告.md"
 
 NOTE_TYPE_ID = 1_776_010_731_001
-FIELD_IDS = [1_776_010_731_101, 1_776_010_731_102, 1_776_010_731_103]
+FIELD_IDS = [1_776_010_731_101, 1_776_010_731_102, 1_776_010_731_103, 1_776_010_731_104]
 TEMPLATE_ID = 1_776_010_731_201
 PARENT_DECK = "每日错题"
-DECK_NAMES = {
-    "408": f"{PARENT_DECK}::408",
-    "数学": f"{PARENT_DECK}::数学",
-}
 
 ANSWER_TITLES = ("解答", "总结", "讲解", "解析", "答案", "辨析图示")
 PLACEHOLDER_RE = re.compile(r"^\s*(?:todo|待补|待填写|待复盘|待确认)\s*[。.!！]?$", re.I)
@@ -52,6 +49,35 @@ QUESTION_HEADING_RE = re.compile(r"^题目(?:[一二三四五六七八九十0-9]
 WIKI_IMAGE_RE = re.compile(r"!\[\[([^\]]+)\]\]")
 MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def subject_specs() -> list[dict[str, object]]:
+    """从配置读取科目和 Anki 参数，不按科目名称写死构建逻辑。"""
+
+    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
+    subjects = config.get("subjects", [])
+    if isinstance(subjects, dict):
+        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
+    specs: list[dict[str, object]] = []
+    for item in subjects:
+        anki = dict(item.get("anki", {})) if isinstance(item, dict) else {}
+        name = str(item["name"])
+        specs.append(
+            {
+                "name": name,
+                "path": str(item["path"]),
+                "deck": str(anki.get("deck", f"{PARENT_DECK}::{name}")),
+                "preset": str(anki.get("preset", f"{name}错题")),
+                "desired_retention": float(anki.get("desired_retention", 0.9)),
+                "new_per_day": int(anki.get("new_per_day", 10)),
+                "new_delays": list(anki.get("new_delays", [10.0])),
+                "new_intervals": list(anki.get("new_intervals", [3, 10, 0])),
+                "review_modifier": float(anki.get("review_modifier", 1.0)),
+                "max_interval": int(anki.get("max_interval", 36500)),
+                "lapse_delays": list(anki.get("lapse_delays", [30.0])),
+            }
+        )
+    return specs
 
 
 @dataclass
@@ -104,7 +130,7 @@ def note_files() -> list[tuple[str, Path]]:
         subjects = [{"name": name, "path": path} for name, path in subjects.items()]
     for item in subjects:
         group, configured_path = str(item["name"]), str(item["path"])
-        subject_root = ROOT / Path(configured_path.replace("/", "\\"))
+        subject_root = resolve_repo_file(configured_path, must_exist=True, must_be_file=False)
         for path in sorted(subject_root.rglob("*.md")):
             found.append((group, path))
     return found
@@ -188,7 +214,7 @@ def image_index() -> dict[str, list[Path]]:
     if isinstance(subjects, dict):
         subjects = [{"name": name, "path": path} for name, path in subjects.items()]
     for item in subjects:
-        subject_root = ROOT / Path(str(item["path"]).replace("/", "\\"))
+        subject_root = resolve_repo_file(str(item["path"]), must_exist=True, must_be_file=False)
         for path in subject_root.rglob("*"):
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
                 index.setdefault(path.name.casefold(), []).append(path.resolve())
@@ -199,10 +225,15 @@ def resolve_image(ref: ImageRef, source: Path, group: str, index: dict[str, list
     try:
         return resolve_repo_image(
             ref.target,
-            base_dirs=(source.parent, source.parent / "assets", ROOT / group / "assets"),
+            base_dirs=(
+                source.parent,
+                source.parent / "assets",
+                source.parent.parent / "assets",
+                ROOT / group / "assets",
+            ),
             unique_basename_fallback=True,
         )
-    except Exception:
+    except WorkflowError:
         return None
 
 
@@ -225,7 +256,7 @@ def inspect_candidates(candidates: list[CardCandidate]) -> None:
                 card.question_id = question_id_for_image(
                     card.question_images[0].resolved, load_question_index()
                 )
-            except Exception as exc:
+            except WorkflowError as exc:
                 card.status, card.reason = "未导入", f"题目 ID 无法确定：{exc}"
                 continue
 
@@ -306,14 +337,14 @@ def stable_guid(card: CardCandidate) -> str:
 
 def make_notetype(col: Collection):
     model = col.models.new("每日错题（题图→答案与解析）")
-    for field_name, field_id in zip(["题目", "答案与解析", "来源"], FIELD_IDS, strict=True):
+    for field_name, field_id in zip(["题目ID", "题目", "答案与解析", "来源"], FIELD_IDS, strict=True):
         field = col.models.new_field(field_name)
         field["id"] = field_id
         col.models.add_field(model, field)
     template = col.models.new_template("题图问答")
     template["id"] = TEMPLATE_ID
     template["qfmt"] = "{{题目}}"
-    template["afmt"] = "{{FrontSide}}<hr id=answer><section class=answer>{{答案与解析}}</section><footer>{{来源}}</footer>"
+    template["afmt"] = "{{FrontSide}}<hr id=answer><section class=answer>{{答案与解析}}</section><footer>Question ID：{{题目ID}}<br>{{来源}}</footer>"
     col.models.add_template(model, template)
     model["css"] = """
 .card {
@@ -364,33 +395,32 @@ def assign_stable_notetype_id(collection_path: Path, generated_id: int) -> None:
 
 def configure_decks(col: Collection) -> tuple[int, dict[str, int]]:
     parent_id = int(col.decks.id(PARENT_DECK))
-    deck_ids = {group: int(col.decks.id(name)) for group, name in DECK_NAMES.items()}
+    specs = subject_specs()
+    deck_names = {str(spec["name"]): str(spec["deck"]) for spec in specs}
+    deck_ids = {group: int(col.decks.id(name)) for group, name in deck_names.items()}
     default = col.decks.get_config(1)
 
-    preset_specs = {
-        "408": {
-            "name": "408错题-高频背诵",
-            "desiredRetention": 0.95,
-            "new": {"delays": [1.0, 10.0], "ints": [1, 3, 0], "perDay": 20},
-            "rev": {"ivlFct": 0.85, "maxIvl": 180, "perDay": 9999},
-            "lapse": {"delays": [10.0], "minInt": 1},
-        },
-        "数学": {
-            "name": "数学错题-低频复习",
-            "desiredRetention": 0.90,
-            "new": {"delays": [10.0], "ints": [3, 10, 0], "perDay": 5},
-            "rev": {"ivlFct": 1.25, "maxIvl": 36500, "perDay": 9999},
-            "lapse": {"delays": [30.0], "minInt": 1},
-        },
-    }
-
-    for group, spec in preset_specs.items():
+    for spec in specs:
+        group = str(spec["name"])
         config = copy.deepcopy(default)
-        config_id = col.decks.add_config_returning_id(spec["name"], config)
+        config_id = col.decks.add_config_returning_id(str(spec["preset"]), config)
         config = col.decks.get_config(config_id)
-        config["desiredRetention"] = spec["desiredRetention"]
-        for section in ("new", "rev", "lapse"):
-            config[section].update(spec[section])
+        config["desiredRetention"] = float(spec["desired_retention"])
+        config["new"].update(
+            {
+                "delays": list(spec["new_delays"]),
+                "ints": list(spec["new_intervals"]),
+                "perDay": int(spec["new_per_day"]),
+            }
+        )
+        config["rev"].update(
+            {
+                "ivlFct": float(spec["review_modifier"]),
+                "maxIvl": int(spec["max_interval"]),
+                "perDay": 9999,
+            }
+        )
+        config["lapse"].update({"delays": list(spec["lapse_delays"]), "minInt": 1})
         col.decks.update_config(config)
         deck = col.decks.get(deck_ids[group])
         col.decks.set_config_id_for_deck_dict(deck, config_id)
@@ -448,7 +478,7 @@ def build_package(cards: list[CardCandidate]) -> dict[str, int]:
                 if ref.resolved:
                     ref.media_name = actual_media_names[ref.resolved]
 
-        counts = {"408": 0, "数学": 0}
+        counts = {str(spec["name"]): 0 for spec in subject_specs()}
         for card in included:
             breadcrumbs = " · ".join([card.group, card.source.stem, *card.context])
             question_body = markdown_to_html(card.question_markdown, card.question_images)
@@ -460,10 +490,16 @@ def build_package(cards: list[CardCandidate]) -> dict[str, int]:
             answer = markdown_to_html(card.answer_markdown, card.answer_images)
             note = col.new_note(model)
             note.guid = stable_guid(card)
+            note["题目ID"] = card.question_id or ""
             note["题目"] = front
             note["答案与解析"] = answer
             note["来源"] = html.escape(source_label(card))
-            note.tags = ["每日错题", card.group, *[part for part in card.source.stem.split("-") if part]]
+            note.tags = [
+                "每日错题",
+                card.group,
+                f"qid::{card.question_id}",
+                *[part for part in card.source.stem.split("-") if part],
+            ]
             col.add_note(note, deck_ids[card.group])
             counts[card.group] += 1
 
@@ -500,7 +536,7 @@ def verify_package(expected: dict[str, int]) -> dict[str, int]:
 
         note_ids = col.find_notes("")
         card_ids = col.find_cards("")
-        if len(note_ids) != expected["408"] + expected["数学"]:
+        if len(note_ids) != sum(value for key, value in expected.items() if key != "媒体"):
             raise RuntimeError(f"导入后的笔记数量异常：{len(note_ids)}")
         if len(card_ids) != len(note_ids):
             raise RuntimeError(f"导入后的卡片数量异常：{len(card_ids)}")
@@ -508,6 +544,8 @@ def verify_package(expected: dict[str, int]) -> dict[str, int]:
         media_refs: set[str] = set()
         for note_id in note_ids:
             note = col.get_note(note_id)
+            if not note["题目ID"] or not any(tag.startswith("qid::") for tag in note.tags):
+                raise RuntimeError(f"卡片 {note_id} 缺少独立 Question ID 字段或标签")
             if "<img " not in note["题目"]:
                 raise RuntimeError(f"卡片 {note_id} 的问题面没有题图")
             answer_text = re.sub(r"<[^>]+>", "", note["答案与解析"]).strip()
@@ -520,20 +558,19 @@ def verify_package(expected: dict[str, int]) -> dict[str, int]:
 
         configs = {config["name"]: config for config in col.decks.all_config()}
         decks = {deck["name"]: deck for deck in col.decks.all()}
-        expected_presets = {
-            "408": ("408错题-高频背诵", 0.95),
-            "数学": ("数学错题-低频复习", 0.90),
-        }
-        for group, (preset_name, retention) in expected_presets.items():
+        for spec in subject_specs():
+            group = str(spec["name"])
+            preset_name = str(spec["preset"])
+            retention = float(spec["desired_retention"])
             config = configs.get(preset_name)
-            deck = decks.get(DECK_NAMES[group])
+            deck = decks.get(str(spec["deck"]))
             if config is None or deck is None:
                 raise RuntimeError(f"导入后缺少 {group} 卡组或复习预设")
             if deck.get("conf") != config.get("id"):
                 raise RuntimeError(f"{group} 卡组没有绑定预期复习预设")
             if abs(float(config.get("desiredRetention", 0)) - retention) > 1e-9:
                 raise RuntimeError(f"{group} 卡组的目标保持率不正确")
-            count = len(col.find_cards(f'deck:"{DECK_NAMES[group]}"'))
+            count = len(col.find_cards(f'deck:"{spec["deck"]}"'))
             if count != expected[group]:
                 raise RuntimeError(f"{group} 卡组导入后为 {count} 张，预期 {expected[group]} 张")
 
@@ -594,8 +631,7 @@ def write_report(cards: list[CardCandidate], counts: dict[str, int], verificatio
         "## 生成结果",
         "",
         f"- 导入包：`{PACKAGE_PATH.name}`",
-        f"- 408 卡片：{counts['408']} 张",
-        f"- 数学卡片：{counts['数学']} 张",
+        *[f"- {spec['name']} 卡片：{counts[str(spec['name'])]} 张" for spec in subject_specs()],
         f"- 媒体文件：{counts['媒体']} 个",
         f"- 未导入条目：{excluded} 条",
         f"- 全新资料库导入验证：通过（{verification['卡片']} 张卡片，{verification['媒体引用']} 个媒体引用均可用）",
@@ -604,8 +640,10 @@ def write_report(cards: list[CardCandidate], counts: dict[str, int], verificatio
         "",
         "| 卡组 | 用法 | FSRS 目标保持率 | 新卡/日 | 学习步长 | 旧调度器间隔修正 |",
         "|---|---|---:|---:|---|---:|",
-        "| 408 | 像单词一样高频背诵 | 95% | 20 | 1 分钟、10 分钟 | 85% |",
-        "| 数学 | 低频回看错题 | 90% | 5 | 10 分钟 | 125% |",
+        *[
+            f"| {spec['name']} | 配置驱动的错题复习 | {float(spec['desired_retention']):.0%} | {spec['new_per_day']} | {', '.join(str(value) for value in spec['new_delays'])} | {float(spec['review_modifier']):.0%} |"
+            for spec in subject_specs()
+        ],
         "",
         "两套预设均已写入 `.apkg`。FSRS 是全局开关：如果你的 Anki 已启用 FSRS，会使用目标保持率；如果没有启用，会使用旧调度器中的学习步长、毕业间隔和间隔修正。",
         "",
