@@ -12,6 +12,7 @@ from typing import Any
 
 from .foundation import SubjectBundle, WorkflowError
 from .markdown_tools import unique_image_paths
+from .repo_paths import read_repo_image
 
 def extract_chat_response_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
@@ -66,7 +67,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for image_path in unique_image_paths(bundle):
         mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        encoded = base64.b64encode(read_repo_image(image_path)).decode("ascii")
         source_ids = [
             source.source_id
             for source in bundle.sources

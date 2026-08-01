@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,9 @@ from .ai_client import call_openai
 from .ai_output import link_source_ids, source_ids_in
 from .scheduling import current_run_time
 from .report_io import write_or_preview_report
+from .run_metadata import run_metadata_block
+from .pipeline_validation import validate_source_ids
+from .pipeline_validation import validate_generated_output
 
 def bundle_for_note(
     bundle: SubjectBundle, note_path: Path, content: str
@@ -58,9 +62,15 @@ def correction_report_for_subject(
     write: bool,
     dirty_paths: set[str],
 ) -> Path:
-    bundle = tracked_subject_bundle(subject, configured_path, dirty_paths)
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    bundle = tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
     report_dir = ROOT / config["reports"]["correction"]
     report_path = report_dir / f"纠错报告-{target_date.isoformat()}-{subject}.md"
+    run_id = uuid.uuid4().hex
+    question_ids = [source.question_id for source in bundle.sources]
+    prompts: list[str] = []
+    pipeline_issues = list(bundle.problems)
+    generation_failed = False
     lines = [
         f"# 笔记纠错报告｜{subject}｜{target_date.isoformat()}",
         "",
@@ -86,28 +96,35 @@ def correction_report_for_subject(
         lines.extend([f"## {note_path.stem}", "", f"- 笔记：{note_link}", ""])
         if use_ai:
             try:
+                prompt = correction_prompt(note_bundle, note_path, content)
+                prompts.append(prompt)
                 draft = call_openai(
-                    correction_prompt(note_bundle, note_path, content),
+                    prompt,
                     note_bundle,
                     config,
                 )
                 if bool(config.get("ai", {}).get("verify_corrections", True)):
+                    verification_prompt = correction_verification_prompt(
+                        note_bundle, note_path, content, draft
+                    )
+                    prompts.append(verification_prompt)
                     generated = call_openai(
-                        correction_verification_prompt(
-                            note_bundle, note_path, content, draft
-                        ),
+                        verification_prompt,
                         note_bundle,
                         config,
                     )
                 else:
                     generated = draft
                 generated = mark_correction_as_unverified(generated)
-                used_ids = source_ids_in(generated)
                 valid_ids = {source.source_id for source in note_bundle.sources}
-                unknown_ids = sorted(used_ids - valid_ids)
+                unknown_ids = validate_source_ids([generated], valid_ids)
                 generated = link_source_ids(generated, note_bundle, report_path)
                 lines.append(generated)
                 if unknown_ids:
+                    generation_failed = True
+                    pipeline_issues.append(
+                        f"{note_path.stem} AI 输出了不存在的来源编号：{', '.join(unknown_ids)}"
+                    )
                     lines.extend(
                         [
                             "",
@@ -115,8 +132,11 @@ def correction_report_for_subject(
                         ]
                     )
             except WorkflowError as exc:
+                generation_failed = True
+                pipeline_issues.append(f"{note_path.stem} AI 审校失败：{exc}")
                 lines.append(f"> AI 审校失败：{exc}")
         else:
+            pipeline_issues.append(f"{note_path.stem} 使用 --no-ai，未生成可验证纠错结论。")
             lines.append("> 本次使用 `--no-ai`，只完成笔记、题图和链接结构检查。")
         lines.extend(
             [
@@ -127,6 +147,18 @@ def correction_report_for_subject(
                 "",
             ]
         )
+    status = validate_generated_output(
+        generated=bool(prompts) and not generation_failed,
+        issues=pipeline_issues,
+        hard_failure=generation_failed,
+    ).status
+    lines.extend(
+        ["", run_metadata_block(
+            kind="correction", status=status, config=config,
+            question_ids=question_ids, prompts=prompts,
+            issues=pipeline_issues, run_id=run_id,
+        ), ""]
+    )
     write_or_preview_report(report_path, "\n".join(lines).rstrip() + "\n", write)
     return report_path
 

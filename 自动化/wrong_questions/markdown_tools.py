@@ -20,8 +20,8 @@ def obsidian_link(label: str | None, target: str) -> str:
 
 def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
     rows = [
-        "| 编号 | 变更类型 | 题图 | 归纳笔记 | 知识点/题型位置 |",
-        "|---|---|---|---|---|",
+        "| 编号 | Question ID | 变更类型 | 题图 | 归纳笔记 | 知识点/题型位置 |",
+        "|---|---|---|---|---|---|",
     ]
     for source in bundle.sources:
         if source.image_path and source.image_path.exists():
@@ -43,14 +43,14 @@ def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
         title = source.title.replace("|", "\\|")
         change_kind = source.change_kind.replace("|", "\\|")
         rows.append(
-            f"| {source.source_id} | {change_kind} | {image_cell} | {note_cell} | {title} |"
+            f"| {source.source_id} | {source.question_id or '待生成'} | {change_kind} | {image_cell} | {note_cell} | {title} |"
         )
     return "\n".join(rows)
 
 def source_payload(bundle: SubjectBundle) -> str:
     parts: list[str] = []
     for source in bundle.sources:
-        parts.append(f"### {source.source_id}")
+        parts.append(f"### {source.source_id}｜{source.question_id or '待生成题目 ID'}")
         parts.append(f"- 科目：{source.subject}")
         parts.append(f"- 变更类型：{source.change_kind}")
         parts.append(f"- 题图仓库路径：{relative_repo_path(source.image_path) if source.image_path else '未解析'}")

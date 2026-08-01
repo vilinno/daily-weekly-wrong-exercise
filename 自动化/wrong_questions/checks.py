@@ -11,10 +11,12 @@ from .source_scanner import build_subject_bundle
 
 def check_workflow(target_date: dt.date | None = None, at: dt.datetime | None = None) -> dict[str, Any]:
     config = load_config()
-    commits = read_commits()
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    commits = read_commits(tracked_ref)
     dirty_paths = read_uncommitted_paths()
     result: dict[str, Any] = {
         "timezone": "Asia/Shanghai",
+        "tracked_ref": tracked_ref,
         "root": str(ROOT),
         "uncommitted_source_paths": sorted(
             path

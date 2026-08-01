@@ -15,6 +15,8 @@ from .ai_client import call_openai
 from .ai_output import link_source_ids, source_ids_in
 from .scheduling import all_commits_in_local_day, current_run_time
 from .report_io import write_or_preview_report
+from .run_metadata import run_metadata_block
+from .pipeline_validation import validate_generated_output, validate_source_ids
 
 def daily_report(
     target_date: dt.date,
@@ -22,7 +24,8 @@ def daily_report(
     use_ai: bool = True,
     write: bool = True,
 ) -> Path:
-    commits = read_commits()
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    commits = read_commits(tracked_ref)
     daily_commits = commits_for_daily(commits, target_date)
     day_commits = all_commits_in_local_day(commits, target_date)
     changed = collect_changed_paths(daily_commits)
@@ -30,11 +33,16 @@ def daily_report(
     dirty_paths = read_uncommitted_paths()
     report_dir = ROOT / config["reports"]["daily"]
     report_path = report_dir / f"日报-{target_date.isoformat()}.md"
+    question_ids: list[str | None] = []
+    prompts: list[str] = []
+    pipeline_issues: list[str] = []
+    generation_failed = False
 
     lines = [
         f"# 每日错题统计｜{target_date.isoformat()}",
         "",
         f"> 生成时间：{current_run_time().strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
+        f"> tracked_ref：`{tracked_ref}`",
         "> 数据口径：只读取 Git 中 message 严格符合 `daily: YYYY-MM-DD` 的已提交内容；未提交内容不纳入统计。",
         "",
         "## Git 提交检查",
@@ -80,6 +88,7 @@ def daily_report(
         lines.extend(["- 未发现数学或 408 目录下的未提交文件。", ""])
     lines.extend(["## 科目统计", ""])
     if not daily_commits:
+        pipeline_issues.append("未找到可用的 daily 提交。")
         lines.append("本日没有可统计的 daily 提交，因此不调用 AI，不生成题目归纳。")
     else:
         for subject, configured_path in subjects.items():
@@ -90,6 +99,8 @@ def daily_report(
                 dirty_paths,
                 commits=daily_commits,
             )
+            question_ids.extend(source.question_id for source in bundle.sources)
+            pipeline_issues.extend(bundle.problems)
             lines.append(f"### {subject}")
             lines.append("")
             lines.append(
@@ -104,21 +115,40 @@ def daily_report(
                 continue
             if use_ai:
                 try:
-                    generated = call_openai(daily_prompt(bundle, target_date, config), bundle, config)
+                    prompt = daily_prompt(bundle, target_date, config)
+                    prompts.append(prompt)
+                    generated = call_openai(prompt, bundle, config)
                     generated = link_source_ids(generated, bundle, report_path)
-                    used_ids = source_ids_in(generated)
                     valid_ids = {source.source_id for source in bundle.sources}
-                    unknown_ids = sorted(used_ids - valid_ids)
+                    unknown_ids = validate_source_ids([generated], valid_ids)
                     lines.extend(["", "#### AI 归纳", "", generated])
                     if unknown_ids:
+                        generation_failed = True
+                        pipeline_issues.append(
+                            f"{subject} AI 输出了不存在的来源编号：{', '.join(unknown_ids)}"
+                        )
                         lines.append("")
                         lines.append(f"> 警告：AI 输出了不存在的来源编号：{', '.join(unknown_ids)}。")
                 except WorkflowError as exc:
+                    generation_failed = True
+                    pipeline_issues.append(f"{subject} AI 生成失败：{exc}")
                     lines.extend(["", "#### AI 归纳", "", f"> AI 生成失败：{exc}"])
             else:
+                pipeline_issues.append(f"{subject} 使用 --no-ai，未生成可验证归纳。")
                 lines.extend(["", "#### AI 归纳", "", "> 本次使用 `--no-ai`，未调用外部 AI。"])
             lines.extend(["", "#### 来源索引", "", source_index_markdown(bundle, report_path), ""])
 
+    status = validate_generated_output(
+        generated=bool(prompts) and not generation_failed,
+        issues=pipeline_issues,
+        hard_failure=generation_failed,
+    ).status
+    lines.extend(
+        ["", run_metadata_block(
+            kind="daily", status=status, config=config,
+            question_ids=question_ids, prompts=prompts, issues=pipeline_issues,
+        ), ""]
+    )
     content = "\n".join(lines).rstrip() + "\n"
     write_or_preview_report(report_path, content, write)
     return report_path

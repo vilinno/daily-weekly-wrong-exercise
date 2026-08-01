@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,11 @@ from anki.collection import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+AUTOMATION_DIR = ROOT / "自动化"
+if str(AUTOMATION_DIR) not in sys.path:
+    sys.path.insert(0, str(AUTOMATION_DIR))
+from wrong_questions.repo_paths import read_repo_image, resolve_repo_image  # noqa: E402
+from wrong_questions.question_index import load_question_index, question_id_for_image  # noqa: E402
 OUTPUT_DIR = ROOT / "Anki"
 PACKAGE_PATH = OUTPUT_DIR / "每日错题-408与数学.apkg"
 MANIFEST_PATH = OUTPUT_DIR / "卡片清单.csv"
@@ -77,6 +83,7 @@ class CardCandidate:
     answer_images: list[ImageRef] = field(default_factory=list)
     status: str = "待检查"
     reason: str = ""
+    question_id: str | None = None
 
 
 def clean_heading(text: str) -> str:
@@ -91,10 +98,15 @@ def is_question_heading(text: str) -> bool:
 
 def note_files() -> list[tuple[str, Path]]:
     found: list[tuple[str, Path]] = []
-    for path in sorted((ROOT / "408" / "笔记").glob("*.md")):
-        found.append(("408", path))
-    for path in sorted((ROOT / "数学").rglob("*.md")):
-        found.append(("数学", path))
+    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
+    subjects = config.get("subjects", [])
+    if isinstance(subjects, dict):
+        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
+    for item in subjects:
+        group, configured_path = str(item["name"]), str(item["path"])
+        subject_root = ROOT / Path(configured_path.replace("/", "\\"))
+        for path in sorted(subject_root.rglob("*.md")):
+            found.append((group, path))
     return found
 
 
@@ -171,7 +183,12 @@ def extract_images(markdown_text: str) -> list[ImageRef]:
 
 def image_index() -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = {}
-    for subject_root in (ROOT / "408", ROOT / "数学"):
+    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
+    subjects = config.get("subjects", [])
+    if isinstance(subjects, dict):
+        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
+    for item in subjects:
+        subject_root = ROOT / Path(str(item["path"]).replace("/", "\\"))
         for path in subject_root.rglob("*"):
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
                 index.setdefault(path.name.casefold(), []).append(path.resolve())
@@ -179,25 +196,14 @@ def image_index() -> dict[str, list[Path]]:
 
 
 def resolve_image(ref: ImageRef, source: Path, group: str, index: dict[str, list[Path]]) -> Path | None:
-    raw_target = ref.target.replace("/", "\\")
-    target_path = Path(raw_target)
-    candidates: list[Path] = []
-    if target_path.is_absolute():
-        candidates.append(target_path)
-    candidates.extend(
-        [
-            source.parent / target_path,
-            source.parent / "assets" / target_path.name,
-            ROOT / group / "assets" / target_path.name,
-        ]
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    matches = index.get(target_path.name.casefold(), [])
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    try:
+        return resolve_repo_image(
+            ref.target,
+            base_dirs=(source.parent, source.parent / "assets", ROOT / group / "assets"),
+            unique_basename_fallback=True,
+        )
+    except Exception:
+        return None
 
 
 def meaningful_answer(markdown_text: str) -> bool:
@@ -214,6 +220,14 @@ def inspect_candidates(candidates: list[CardCandidate]) -> None:
         card.answer_images = extract_images(card.answer_markdown)
         for ref in card.question_images + card.answer_images:
             ref.resolved = resolve_image(ref, card.source, card.group, index)
+        if card.question_images and card.question_images[0].resolved:
+            try:
+                card.question_id = question_id_for_image(
+                    card.question_images[0].resolved, load_question_index()
+                )
+            except Exception as exc:
+                card.status, card.reason = "未导入", f"题目 ID 无法确定：{exc}"
+                continue
 
         if not card.question_images:
             card.status, card.reason = "未导入", "题目区域没有题图"
@@ -285,7 +299,7 @@ def markdown_to_html(markdown_text: str, refs: list[ImageRef]) -> str:
 
 
 def stable_guid(card: CardCandidate) -> str:
-    key = f"{card.source.relative_to(ROOT).as_posix()}:{card.line}"
+    key = card.question_id or f"{card.source.relative_to(ROOT).as_posix()}:{card.line}"
     digest = hashlib.sha1(key.encode("utf-8")).digest()[:10]
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
@@ -385,7 +399,7 @@ def configure_decks(col: Collection) -> tuple[int, dict[str, int]]:
 
 def source_label(card: CardCandidate) -> str:
     relative = card.source.relative_to(ROOT).as_posix()
-    return f"来源：{relative}（第 {card.line} 行）"
+    return f"Question ID：{card.question_id or '待生成'}；来源：{relative}（第 {card.line} 行）"
 
 
 def build_package(cards: list[CardCandidate]) -> dict[str, int]:
@@ -422,11 +436,12 @@ def build_package(cards: list[CardCandidate]) -> dict[str, int]:
 
         actual_media_names: dict[Path, str] = {}
         for path in media_paths:
+            image_bytes = read_repo_image(path)
             desired = media_names[path]
             if path.name == desired:
-                actual = col.media.add_file(str(path))
+                actual = col.media.write_data(desired, image_bytes)
             else:
-                actual = col.media.write_data(desired, path.read_bytes())
+                actual = col.media.write_data(desired, image_bytes)
             actual_media_names[path] = actual
         for card in included:
             for ref in card.question_images + card.answer_images:
@@ -532,12 +547,13 @@ def verify_package(expected: dict[str, int]) -> dict[str, int]:
 def write_manifest(cards: list[CardCandidate]) -> None:
     with MANIFEST_PATH.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["卡组", "状态", "标题", "来源文件", "行号", "题图", "未导入原因"])
+        writer.writerow(["卡组", "状态", "Question ID", "标题", "来源文件", "行号", "题图", "未导入原因"])
         for card in cards:
             writer.writerow(
                 [
                     card.group,
                     card.status,
+                    card.question_id or "",
                     card.title,
                     card.source.relative_to(ROOT).as_posix(),
                     card.line,

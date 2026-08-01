@@ -7,6 +7,7 @@
 from . import git_store
 from .ai_client import *
 from .ai_output import *
+from .audit import *
 from .checks import *
 from .correction_workflow import *
 from .daily_workflow import *

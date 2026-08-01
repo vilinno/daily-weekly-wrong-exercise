@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .foundation import ALLOWED_MESSAGE_RES, BEIJING, Commit, DIFF_HUNK_RE, NoteDelta, ROOT, WorkflowError
+from .repo_paths import resolve_repo_file
 
 def run_git(*args: str) -> str:
     command = ["git", "-C", str(ROOT), *args]
@@ -56,15 +57,24 @@ def parse_git_datetime(value: str) -> dt.datetime:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(BEIJING)
 
-def read_commits() -> list[Commit]:
-    output = run_git("log", "--all", "--format=%H%x09%cI%x09%s")
+def read_commits(tracked_ref: str = "HEAD") -> list[Commit]:
+    """只读取指定 ref 的祖先链，不扫描 --all。"""
+    ref = tracked_ref.strip() or "HEAD"
+    output = run_git("log", ref, "--format=%H%x09%cI%x09%P%x09%s")
     commits: list[Commit] = []
     for line in output.splitlines():
-        fields = line.split("\t", 2)
-        if len(fields) != 3:
+        fields = line.split("\t", 3)
+        if len(fields) != 4:
             continue
-        sha, committed_at, message = fields
-        commits.append(Commit(sha, parse_git_datetime(committed_at), message))
+        sha, committed_at, parents, message = fields
+        commits.append(
+            Commit(
+                sha,
+                parse_git_datetime(committed_at),
+                message,
+                is_merge=len(parents.split()) > 1,
+            )
+        )
     return commits
 
 def parent_commit_sha(commit_sha: str) -> str:
@@ -79,11 +89,14 @@ def parent_commit_sha(commit_sha: str) -> str:
 
 def read_git_file(commit_sha: str, relative_path: str) -> str:
     """读取指定提交中的 UTF-8 文本文件。"""
+    safe_path = resolve_repo_file(
+        normalize_repo_path(relative_path), must_exist=False, must_be_file=False
+    ).relative_to(ROOT.resolve()).as_posix()
     return run_git(
         "-c",
         "core.quotePath=false",
         "show",
-        f"{commit_sha}:{normalize_repo_path(relative_path)}",
+        f"{commit_sha}:{safe_path}",
     )
 
 def parse_diff_new_line_ranges(diff_text: str) -> list[tuple[int, int]]:
@@ -154,6 +167,8 @@ def is_allowed_message(message: str) -> bool:
 def commit_local_date_issues(commits: Iterable[Commit]) -> list[str]:
     issues: list[str] = []
     for commit in commits:
+        if commit.is_merge:
+            continue
         if not is_allowed_message(commit.message):
             issues.append(
                 f"提交 {commit.short_sha} 的 message 不符合约定：`{commit.message}`"
@@ -164,11 +179,19 @@ def commit_local_date_issues(commits: Iterable[Commit]) -> list[str]:
                 f"{commit.daily_date.isoformat()}，北京时间提交日期为 "
                 f"{commit.committed_at.date().isoformat()}"
             )
+        if commit.nonstandard_daily:
+            issues.append(
+                f"提交 {commit.short_sha} 使用兼容但不规范的 message：`{commit.message}`；"
+                "建议改为 `daily: YYYY-MM-DD`。"
+            )
     return issues
 
 def commits_for_daily(commits: Iterable[Commit], target_date: dt.date) -> list[Commit]:
     return sorted(
-        [commit for commit in commits if commit.daily_date == target_date],
+        [
+            commit for commit in commits
+            if not commit.is_merge and commit.daily_date == target_date
+        ],
         key=lambda commit: commit.committed_at,
     )
 
@@ -179,7 +202,8 @@ def commits_for_week(
         [
             commit
             for commit in commits
-            if commit.daily_date is not None
+            if not commit.is_merge
+            and commit.daily_date is not None
             and start <= commit.committed_at < end
         ],
         key=lambda commit: commit.committed_at,
@@ -225,7 +249,7 @@ def is_ignored_source_path(relative_path: str) -> bool:
     }
 
 def repo_path(relative_path: str) -> Path:
-    return (ROOT / Path(relative_path.replace("/", os.sep))).resolve()
+    return resolve_repo_file(relative_path, must_exist=False, must_be_file=False)
 
 def relative_repo_path(path: Path) -> str:
     try:

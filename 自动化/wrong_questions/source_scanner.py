@@ -9,6 +9,8 @@ from urllib.parse import unquote
 
 from .foundation import Commit, HEADING_RE, IMAGE_RE, IMAGE_SUFFIXES, OBSIDIAN_IMAGE_RE, ROOT, Source, SubjectBundle
 from .git_store import normalize_repo_path, note_deltas_for_scope, relative_repo_path, repo_path, run_git
+from .repo_paths import resolve_repo_image
+from .question_index import assign_question_ids, load_question_index
 
 def parse_image_target(inner: str) -> str:
     value = inner.strip()
@@ -46,29 +48,17 @@ def iter_image_targets(line: str) -> Iterable[str]:
 
 def resolve_image_reference(note_path: Path, raw_ref: str) -> Path | None:
     decoded = unquote(raw_ref.strip())
-    if not decoded or decoded.startswith(("http://", "https://", "data:")):
+    if not decoded:
         return None
-
-    candidates: list[Path] = []
-    raw_path = Path(decoded)
-    if raw_path.is_absolute():
-        candidates.append(raw_path)
-    else:
-        candidates.append(note_path.parent / raw_path)
-        candidates.append(ROOT / raw_path)
-
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve()
-
-    # 兼容历史绝对路径失效、但题图文件名仍然唯一的情况。
-    filename = decoded.replace("\\", "/").rsplit("/", 1)[-1]
-    matches = [
-        path
-        for path in ROOT.rglob(filename)
-        if path.is_file() and ".git" not in path.parts
-    ]
-    return matches[0].resolve() if len(matches) == 1 else None
+    try:
+        return resolve_repo_image(
+            decoded,
+            base_dirs=(note_path.parent, note_path.parent / "assets"),
+            unique_basename_fallback=True,
+        )
+    except Exception:
+        # 扫描阶段保留可定位的 Source 与问题，真正读取图片时仍由同一安全入口拒绝。
+        return None
 
 def note_section_context(
     content: str, anchor_line_number: int, max_chars: int = 4000
@@ -468,6 +458,11 @@ def build_subject_bundle(
     )
     for index, source in enumerate(sources, start=1):
         source.source_id = f"S{index:03d}"
+    try:
+        assign_question_ids(sources, load_question_index())
+    except Exception as exc:
+        problems.append(f"题目 ID 索引暂时无法读取，已使用候选稳定 ID：{exc}")
+        assign_question_ids(sources)
 
     # 当前变更中存在 Markdown，但没有题图时，明确提示，不把它误判为题目已完整归档。
     for relative_path in subject_changed:
@@ -480,10 +475,13 @@ def tracked_subject_bundle(
     subject: str,
     configured_path: str,
     dirty_paths: set[str] | None = None,
+    tracked_ref: str = "HEAD",
 ) -> SubjectBundle:
     """扫描 HEAD 中已跟踪的整科资料，用于复盘和纠错。"""
     prefix = configured_path.replace("\\", "/").strip("/")
-    output = run_git("-c", "core.quotePath=false", "ls-files")
+    output = run_git(
+        "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", tracked_ref
+    )
     tracked = {
         normalize_repo_path(line.strip()): {"tracked"}
         for line in output.splitlines()

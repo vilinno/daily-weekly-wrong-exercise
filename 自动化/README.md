@@ -24,6 +24,11 @@ wrong_questions/
 ├── review_workflow.py        # 复盘追踪与掌握度测试
 ├── correction_workflow.py    # 纠错候选报告
 ├── checks.py                 # 只读工作流检查
+├── repo_paths.py             # 仓库内路径与图片读取安全入口
+├── question_index.py         # Question ID、图片哈希和路径别名索引
+├── run_metadata.py            # 统一流水线运行元数据与状态
+├── pipeline_validation.py     # 统一来源验证和状态判定
+├── audit.py                   # 全仓库只读审计与 JSON/Markdown 报告
 └── cli.py                    # 参数解析和命令调度
 ```
 
@@ -37,6 +42,11 @@ wrong_questions/
 - 周测范围：运行时刻向前 7 天；周日早晨生成的是上一周的复习材料。
 - 每科题量：约 10 题，目标为约 70% 原题/原题改编、30% 变式题。
 - 不读取未提交内容，不自动提交生成物。
+- 所有 Markdown、题图和 Anki 媒体必须经过仓库内安全路径入口；远程 URL、Windows 绝对路径、路径逃逸、仓库外符号链接和伪装图片会被拒绝。
+- Git 只扫描 `config.json` 中 `git.tracked_ref` 的祖先链，不使用 `git log --all`；merge commit 不作为 daily 来源。
+- 周测、复盘题目与答案在同一运行锁内成对原子写入；单文件报告使用临时文件、fsync 和 replace。
+- `audit` 只读扫描过渡站、Markdown 引用、路径安全、孤立/重复题图、科目目录、Question ID 索引和报告状态；发现问题返回非零并保留 JSON/Markdown findings，不自动修复资料。
+- 每份报告的运行元数据同时包含 JSON fenced block，`issues` 的每项都有 `code`、`severity`、`message`。
 - 题型、方法和测试题通过 `S001` 等来源编号链接到对应题图；报告使用 Obsidian 内部链接，末尾同时提供来源索引。
 - 复盘记录由用户填写在 `复盘/复盘记录.md`；自动化只读取已提交版本，不会代替用户勾选或改写记录。
 - 纠错按篇结合 Markdown 全文和原始题图审校，只在 `报告/纠错/` 中反馈，不自动修改学习笔记。
@@ -96,7 +106,7 @@ chore: 初始化或维护说明
 fix: 修复说明
 ```
 
-每日脚本只把严格符合 `daily: YYYY-MM-DD` 的提交作为错题资料来源；不符合格式的提交会在日报中提示。
+每日脚本把 `daily: YYYY-MM-DD` 作为规范格式；历史兼容的 `daily:YYYY-MM-DD` 仍可解析，但会在报告中标记为不规范。`git.tracked_ref` 默认是 `HEAD`，不会扫描其他 ref。
 
 ## 增量统计口径
 
@@ -108,14 +118,14 @@ fix: 修复说明
 
 ## 配置 AI
 
-脚本使用 OpenAI 兼容的 Chat Completions API，并将题图作为 `image_url` Base64 图片输入。当前约定的模型是 `gpt-5.6-sol`，配置文件中的模型只是默认值，可使用环境变量覆盖。
+脚本使用 OpenAI 兼容的 Chat Completions API，并将题图作为 `image_url` Base64 图片输入。模型以 `config.json` 的 `ai.default_model` 为默认值，可使用 `OPENAI_MODEL` 覆盖；核验模型可使用 `OPENAI_VERIFY_MODEL` 单独配置。
 
 推荐配置方式：
 
 1. 将 `.env.example` 复制为 `.env`。
 2. 在 `.env` 中填写 `OPENAI_API_KEY`。
 3. 设置 `OPENAI_BASE_URL`，脚本会拼接 `/v1/chat/completions`；也可以直接设置 `OPENAI_CHAT_COMPLETIONS_URL`。
-4. 设置 `OPENAI_MODEL`；未设置时使用 `claude-opus-4-8`。
+4. 可选设置 `OPENAI_MODEL`；未设置时使用配置文件中的 `ai.default_model`。
 5. 不要把 `.env` 提交到 Git。
 
 也可以直接设置 Windows 用户环境变量。脚本不会在日志或报告中输出密钥。
@@ -130,6 +140,8 @@ python .\自动化\main.py daily --date 2026-07-21
 python .\自动化\main.py weekly --at 2026-07-27T08:00:00+08:00
 python .\自动化\main.py review --date 2026-07-29
 python .\自动化\main.py correct --date 2026-07-29
+python .\自动化\main.py audit --dry-run --json
+python .\自动化\main.py index --dry-run
 ```
 
 任务计划程序使用 `--scheduled`，脚本会按照配置中的北京时间边界计算统计日期和周测结束时间；即使 Windows 因睡眠或延迟唤醒，也不会把实际唤醒时刻误当成统计边界：

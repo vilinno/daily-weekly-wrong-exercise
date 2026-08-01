@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import ntpath
 import os
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,9 +23,11 @@ CONFIG_PATH = AUTOMATION_DIR / "config.json"
 ENV_PATH = AUTOMATION_DIR / ".env"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 DAILY_RE = re.compile(r"^daily: (?P<date>\d{4}-\d{2}-\d{2})$")
+DAILY_COMPAT_RE = re.compile(r"^daily:(?P<date>\d{4}-\d{2}-\d{2})$")
 WEEKLY_RE = re.compile(r"^weekly: (?P<week>\d{4}-W\d{2})$")
 ALLOWED_MESSAGE_RES = (
     DAILY_RE,
+    DAILY_COMPAT_RE,
     WEEKLY_RE,
     re.compile(r"^(?:docs|chore|fix): .+$"),
 )
@@ -57,6 +61,7 @@ class Commit:
     sha: str
     committed_at: dt.datetime
     message: str
+    is_merge: bool = False
 
     @property
     def short_sha(self) -> str:
@@ -64,13 +69,17 @@ class Commit:
 
     @property
     def daily_date(self) -> dt.date | None:
-        match = DAILY_RE.fullmatch(self.message)
+        match = DAILY_RE.fullmatch(self.message) or DAILY_COMPAT_RE.fullmatch(self.message)
         if not match:
             return None
         try:
             return dt.date.fromisoformat(match.group("date"))
         except ValueError:
             return None
+
+    @property
+    def nonstandard_daily(self) -> bool:
+        return bool(re.fullmatch(r"daily:\d{4}-\d{2}-\d{2}", self.message))
 
 @dataclass
 class Source:
@@ -83,6 +92,7 @@ class Source:
     context: str = ""
     change_kind: str = "题目"
     line_number: int | None = None
+    question_id: str | None = None
 
     @property
     def title(self) -> str:
@@ -185,12 +195,31 @@ def validate_config(config: Any) -> dict[str, Any]:
     review = config.get("review")
     if not isinstance(daily, dict) or not isinstance(weekly, dict):
         raise WorkflowError("配置必须同时包含 daily 和 weekly 配置。")
-    if not isinstance(subjects, dict) or not {"数学", "408"}.issubset(subjects):
-        raise WorkflowError("subjects 必须同时配置数学和 408，且两科要分开生成报告。")
+    if isinstance(subjects, list):
+        normalized_subjects: dict[str, str] = {}
+        for item in subjects:
+            if not isinstance(item, dict) or not item.get("name") or not item.get("path"):
+                raise WorkflowError("subjects 列表中的每项必须包含 name 和 path。")
+            name, path = str(item["name"]).strip(), str(item["path"]).strip()
+            if name in normalized_subjects:
+                raise WorkflowError(f"subjects 中有重复科目：{name}")
+            normalized_subjects[name] = path
+        subjects = normalized_subjects
+        config["subjects"] = subjects
+    if not isinstance(subjects, dict) or not subjects:
+        raise WorkflowError("subjects 必须是非空列表（兼容旧版对象映射）。")
+    for subject, configured_path in subjects.items():
+        path = str(configured_path).replace("\\", "/").strip("/")
+        if not subject or not path or ntpath.isabs(str(configured_path)) or urlparse(str(configured_path)).scheme or ".." in path.split("/"):
+            raise WorkflowError(f"subjects.{subject} 必须是仓库内相对目录。")
     if not isinstance(reports, dict) or not reports.get("daily") or not reports.get("weekly"):
         raise WorkflowError("reports 必须配置 daily 和 weekly 输出目录。")
     if not isinstance(review, dict):
         raise WorkflowError("配置必须包含 review 复盘配置。")
+
+    git = config.get("git", {})
+    if not isinstance(git, dict) or not str(git.get("tracked_ref", "HEAD")).strip():
+        raise WorkflowError("git.tracked_ref 必须是非空 Git 引用。")
 
     parse_clock_time(daily.get("time"), "daily.time")
     parse_clock_time(weekly.get("time"), "weekly.time")
@@ -227,7 +256,7 @@ def validate_config(config: Any) -> dict[str, Any]:
     if any(value < 0 for value in parsed_intervals.values()):
         raise WorkflowError("review.intervals_days 中的值不能小于 0。")
 
-    report_keys = ("daily", "weekly", "review", "correction")
+    report_keys = ("daily", "weekly", "review", "correction", "audit")
     for key in report_keys:
         if not reports.get(key):
             raise WorkflowError(f"reports 必须配置 {key} 输出目录。")

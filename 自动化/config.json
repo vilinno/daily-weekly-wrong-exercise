@@ -21,15 +21,22 @@
       "已掌握": 7
     }
   },
-  "subjects": {
-    "数学": "数学",
-    "408": "408"
+  "subjects": [
+    {"name": "数学", "path": "数学"},
+    {"name": "408", "path": "408"}
+  ],
+  "git": {
+    "tracked_ref": "HEAD"
+  },
+  "pipeline": {
+    "prompt_version": "v1"
   },
   "reports": {
     "daily": "报告/每日",
     "weekly": "报告/每周",
     "review": "报告/复盘",
-    "correction": "报告/纠错"
+    "correction": "报告/纠错",
+    "audit": "报告/审计"
   },
   "tasks": {
     "daily_name": "每日错题-每日统计",

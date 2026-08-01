@@ -79,7 +79,7 @@ def parse_review_log(content: str) -> tuple[list[ReviewEntry], list[str]]:
     return entries, problems
 
 def load_review_log(
-    config: dict[str, Any], dirty_paths: set[str]
+    config: dict[str, Any], dirty_paths: set[str], tracked_ref: str = "HEAD"
 ) -> tuple[list[ReviewEntry], list[str]]:
     relative_path = normalize_repo_path(str(config["review"]["log_path"]))
     problems: list[str] = []
@@ -88,7 +88,7 @@ def load_review_log(
             f"复盘记录 `{relative_path}` 存在未提交修改；本次只读取 HEAD 中已提交的版本。"
         )
     try:
-        content = read_git_file("HEAD", relative_path)
+        content = read_git_file(tracked_ref, relative_path)
     except WorkflowError:
         problems.append(
             f"HEAD 中未找到复盘记录 `{relative_path}`；本次按没有历史记录处理。"
@@ -99,6 +99,8 @@ def load_review_log(
 
 def review_targets_for_source(source: Source) -> set[str]:
     targets: set[str] = set()
+    if source.question_id:
+        targets.add(source.question_id)
     if source.image_path:
         targets.add(relative_repo_path(source.image_path))
     if source.note_path:

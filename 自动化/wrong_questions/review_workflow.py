@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,9 @@ from .quality import removable_incomplete_choice_numbers, remove_numbered_markdo
 from .ai_client import call_openai
 from .ai_output import link_source_ids, split_review_output
 from .scheduling import current_run_time
-from .report_io import write_or_preview_report
+from .report_io import write_report_pair
+from .run_metadata import run_metadata_block
+from .pipeline_validation import validate_generated_output
 
 def review_report_for_subject(
     subject: str,
@@ -29,7 +32,8 @@ def review_report_for_subject(
     write: bool,
     dirty_paths: set[str],
 ) -> tuple[Path, Path]:
-    bundle = tracked_subject_bundle(subject, configured_path, dirty_paths)
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    bundle = tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
     statuses = build_review_statuses(bundle, entries, target_date, config)
     question_limit = int(config["review"].get("questions_per_subject", 8))
     selected = select_review_sources(
@@ -44,10 +48,15 @@ def review_report_for_subject(
         for mastery in ("未阅读", "未测试", "薄弱", "部分掌握", "已掌握")
     }
     problems = [*log_problems, *bundle.problems]
+    run_id = uuid.uuid4().hex
+    question_ids = [source.question_id for source in selected.sources]
+    prompts: list[str] = []
+    generation_failed = False
 
     if selected.sources and use_ai:
         try:
             base_prompt = review_prompt(selected, statuses, target_date, config)
+            prompts.append(base_prompt)
             generated = call_openai(base_prompt, selected, config)
             test, answer = split_review_output(generated)
             valid_ids = {source.source_id for source in selected.sources}
@@ -55,8 +64,10 @@ def review_report_for_subject(
                 test, answer, valid_ids, question_limit
             )
             if quality_issues:
+                repair_prompt = review_repair_prompt(base_prompt, generated, quality_issues)
+                prompts.append(repair_prompt)
                 generated = call_openai(
-                    review_repair_prompt(base_prompt, generated, quality_issues),
+                    repair_prompt,
                     selected,
                     config,
                 )
@@ -70,10 +81,12 @@ def review_report_for_subject(
                     + "；".join(quality_issues)
                 )
             if bool(config.get("ai", {}).get("verify_reviews", True)):
+                verification_prompt = review_verification_prompt(
+                    selected, generated, question_limit
+                )
+                prompts.append(verification_prompt)
                 generated = call_openai(
-                    review_verification_prompt(
-                        selected, generated, question_limit
-                    ),
+                    verification_prompt,
                     selected,
                     config,
                 )
@@ -97,12 +110,16 @@ def review_report_for_subject(
             test = link_source_ids(test, selected, report_path)
             answer = link_source_ids(answer, selected, answer_path)
         except WorkflowError as exc:
+            generation_failed = True
+            problems.append(f"AI 生成或核验失败：{exc}")
             test = f"## 掌握度测试\n\n> AI 生成失败：{exc}"
             answer = f"## 答案与核验\n\n> 无可核验内容。原始错误：{exc}"
     elif selected.sources:
+        problems.append("使用 --no-ai，未生成可验证掌握度测试和答案。")
         test = "## 掌握度测试\n\n> 本次使用 `--no-ai`，未生成测试题。"
         answer = "## 答案与核验\n\n> 本次使用 `--no-ai`，未生成答案。"
     else:
+        problems.append("当前没有可用于命题的已提交来源。")
         test = "## 掌握度测试\n\n> 当前没有可用于命题的已提交来源。"
         answer = "## 答案与核验\n\n> 当前没有测试题。"
 
@@ -112,10 +129,21 @@ def review_report_for_subject(
         "> 数据口径：读取 HEAD 中已提交的题图、笔记和复盘记录；未提交科目资料不送往外部 AI。",
         "",
     ]
+    status = validate_generated_output(
+        generated=bool(prompts) and not generation_failed,
+        issues=problems,
+        hard_failure=generation_failed,
+    ).status
+    metadata_block = run_metadata_block(
+        kind="review", status=status, config=config,
+        question_ids=question_ids, prompts=prompts, issues=problems, run_id=run_id,
+    )
     question_lines = [
         f"# 错题复盘｜{subject}｜{target_date.isoformat()}",
         "",
         *common_metadata,
+        metadata_block,
+        "",
         "## 复盘概览",
         "",
         f"- 共追踪 {len(statuses)} 个题目来源，其中 {due_count} 个已到期或从未复盘。",
@@ -161,6 +189,8 @@ def review_report_for_subject(
         f"# 错题复盘答案与核验｜{subject}｜{target_date.isoformat()}",
         "",
         *common_metadata,
+        metadata_block,
+        "",
         answer,
         "",
         "## 判定建议",
@@ -176,11 +206,9 @@ def review_report_for_subject(
         else "无。",
         "",
     ]
-    write_or_preview_report(
-        report_path, "\n".join(question_lines).rstrip() + "\n", write
-    )
-    write_or_preview_report(
-        answer_path, "\n".join(answer_lines).rstrip() + "\n", write
+    write_report_pair(
+        report_path, "\n".join(question_lines).rstrip() + "\n",
+        answer_path, "\n".join(answer_lines).rstrip() + "\n", write,
     )
     return report_path, answer_path
 
@@ -192,7 +220,8 @@ def review_reports(
     subject_filter: str | None = None,
 ) -> list[Path]:
     dirty_paths = read_uncommitted_paths()
-    entries, log_problems = load_review_log(config, dirty_paths)
+    tracked_ref = str(config.get("git", {}).get("tracked_ref", "HEAD"))
+    entries, log_problems = load_review_log(config, dirty_paths, tracked_ref)
     future_entries = [entry for entry in entries if entry.reviewed_on > target_date]
     if future_entries:
         log_problems.append(

@@ -6,12 +6,14 @@ import argparse
 import json
 import sys
 
-from .foundation import WorkflowError, load_config, load_dotenv
+from .foundation import ROOT, WorkflowError, load_config, load_dotenv
 from .daily_workflow import daily_report
 from .weekly_workflow import weekly_reports
 from .review_workflow import review_reports
 from .correction_workflow import correction_reports
 from .checks import check_workflow
+from .question_index import generate_question_index
+from .audit import audit_repository, write_audit_reports, audit_markdown
 from .scheduling import current_run_time, parse_date, parse_datetime, scheduled_daily_date, scheduled_weekly_end
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     check = subparsers.add_parser("check", help="只读检查 Git 和题图/笔记解析，不写入报告")
     check.add_argument("--date", help="检查指定每日日期：YYYY-MM-DD")
     check.add_argument("--at", help="检查指定周测结束时间：ISO 8601")
+
+    index = subparsers.add_parser("index", help="生成稳定 Question ID 索引")
+    index.add_argument("--subject", help="只处理指定科目")
+    index.add_argument("--dry-run", action="store_true", help="只预览，不写入索引")
+
+    audit = subparsers.add_parser("audit", help="只读审计全仓库结构、来源和报告状态")
+    audit.add_argument("--dry-run", action="store_true", help="只输出结果，不写入审计报告")
+    audit.add_argument("--json", action="store_true", help="dry-run 时只输出 JSON")
     return parser
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,6 +141,29 @@ def main(argv: list[str] | None = None) -> int:
             at = parse_datetime(args.at) if args.at else None
             print(json.dumps(check_workflow(target_date, at), ensure_ascii=False, indent=2))
             return 0
+        if args.command == "index":
+            value, problems = generate_question_index(
+                config, dry_run=args.dry_run, subject_filter=args.subject
+            )
+            print(json.dumps({"dry_run": args.dry_run, "index": value, "problems": problems}, ensure_ascii=False, indent=2))
+            return 0 if not problems else 2
+        if args.command == "audit":
+            result = audit_repository(config)
+            audit_dir = ROOT / str(config["reports"]["audit"])
+            date_text = current_run_time().strftime("%Y-%m-%d")
+            json_path = audit_dir / f"仓库审计-{date_text}.json"
+            markdown_path = audit_dir / f"仓库审计-{date_text}.md"
+            if args.dry_run:
+                if args.json:
+                    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+                else:
+                    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+                    print(audit_markdown(result))
+            else:
+                write_audit_reports(result, json_path, markdown_path)
+                print(f"已生成：{json_path}")
+                print(f"已生成：{markdown_path}")
+            return 0 if result.status == "validated" else 2
     except WorkflowError as exc:
         print(f"工作流失败：{exc}", file=sys.stderr)
         return 2

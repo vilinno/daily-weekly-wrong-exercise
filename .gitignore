@@ -4,5 +4,8 @@
 自动化/__pycache__/
 自动化/tests/__pycache__/
 *.pyc
+**/__pycache__/
+Anki/*.apkg
+报告/.workflow.lock
 
 .obsidian/
