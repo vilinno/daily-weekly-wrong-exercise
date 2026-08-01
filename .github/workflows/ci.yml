@@ -21,13 +21,13 @@ jobs:
       - name: Anki 仓库内媒体安全 fixture
         run: python Anki/check_anki.py
       - name: 无 API 的最小流水线验收
-        run: python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run
+        run: python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run --tracked-ref HEAD
       - name: 周测无 API 验收
-        run: python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run
+        run: python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run --tracked-ref HEAD
       - name: 复盘无 API 验收
-        run: python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run
+        run: python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run --tracked-ref HEAD
       - name: 纠错无 API 验收
-        run: python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run
+        run: python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run --tracked-ref HEAD
 
   windows:
     runs-on: windows-latest
@@ -47,7 +47,7 @@ jobs:
       - name: 无 API 工作流矩阵验收
         shell: pwsh
         run: |
-          python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run
-          python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run
-          python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run
-          python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run
+          python 自动化/main.py daily --date 2026-07-31 --no-ai --dry-run --tracked-ref HEAD
+          python 自动化/main.py weekly --at 2026-08-01T08:00:00+08:00 --no-ai --dry-run --tracked-ref HEAD
+          python 自动化/main.py review --date 2026-08-01 --no-ai --dry-run --tracked-ref HEAD
+          python 自动化/main.py correct --date 2026-08-01 --no-ai --dry-run --tracked-ref HEAD
