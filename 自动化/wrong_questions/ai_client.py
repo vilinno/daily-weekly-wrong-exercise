@@ -8,11 +8,33 @@ import mimetypes
 import os
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from .foundation import SubjectBundle, WorkflowError
-from .markdown_tools import unique_image_paths
-from .repo_paths import read_repo_image
+from .git_store import read_git_bytes, relative_repo_path
+from .repo_paths import read_repo_image, validate_image_bytes
+
+
+@dataclass(frozen=True)
+class AIResult:
+    """一次实际 AI 请求的正文和可追溯凭据。"""
+
+    text: str
+    role: str
+    model: str
+    endpoint: str
+    provider: str = "openai-compatible"
+    request_id: str | None = None
+
+    def metadata(self) -> dict[str, str | None]:
+        return {
+            "role": self.role,
+            "provider": self.provider,
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "request_id": self.request_id,
+        }
 
 def extract_chat_response_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
@@ -53,26 +75,75 @@ def chat_completions_endpoint(config: dict[str, Any]) -> str:
         return str(configured).rstrip("/")
     return "https://api.openai.com/v1/chat/completions"
 
-def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> str:
+def _model_for_role(config: dict[str, Any], role: str) -> str:
+    if role not in {"generation", "verification"}:
+        raise WorkflowError(f"未知 AI 调用角色：{role}")
+    ai_config = config.get("ai", {})
+    generation_model = os.environ.get("OPENAI_MODEL", "").strip() or str(
+        ai_config.get("default_model", "claude-opus-4-8")
+    )
+    if role == "verification":
+        configured = str(ai_config.get("verify_model", "")).strip()
+        return os.environ.get("OPENAI_VERIFY_MODEL", "").strip() or configured or generation_model
+    return generation_model
+
+
+def _image_data(path, revision: str | None) -> bytes:
+    if revision:
+        relative_path = relative_repo_path(path)
+        try:
+            data = read_git_bytes(revision, relative_path)
+        except WorkflowError as exc:
+            raise WorkflowError(
+                f"无法从提交 `{revision}` 读取题图 `{relative_path}`：{exc}"
+            ) from exc
+        return validate_image_bytes(data, relative_path)
+    return read_repo_image(path)
+
+
+def call_openai(
+    prompt: str,
+    bundle: SubjectBundle,
+    config: dict[str, Any],
+    *,
+    role: str = "generation",
+) -> AIResult:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise WorkflowError(
             "未找到 OPENAI_API_KEY。请设置用户环境变量，或复制自动化/.env.example 为自动化/.env 后填写。"
         )
     ai_config = config.get("ai", {})
-    model = os.environ.get("OPENAI_MODEL", "").strip() or ai_config.get(
-        "default_model", "claude-opus-4-8"
-    )
+    model = _model_for_role(config, role)
     endpoint = chat_completions_endpoint(config)
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for image_path in unique_image_paths(bundle):
+    grouped_images: dict[tuple[str, str | None], list[Any]] = {}
+    for source in bundle.sources:
+        if source.image_path:
+            key = (relative_repo_path(source.image_path), source.image_revision)
+            grouped_images.setdefault(key, []).append(source)
+    max_images = int(ai_config.get("max_images_per_request", 12))
+    max_total_bytes = int(ai_config.get("max_total_image_bytes", 40_000_000))
+    if len(grouped_images) > max_images:
+        raise WorkflowError(
+            f"本次请求包含 {len(grouped_images)} 张题图，超过 {max_images} 张上限；"
+            "请按 Question ID 边界分批。"
+        )
+    total_image_bytes = 0
+    for (relative_path, revision), sources in grouped_images.items():
+        image_path = sources[0].image_path
+        if image_path is None:  # pragma: no cover - grouped_images only accepts paths
+            continue
         mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
-        encoded = base64.b64encode(read_repo_image(image_path)).decode("ascii")
-        source_ids = [
-            source.source_id
-            for source in bundle.sources
-            if source.image_path == image_path
-        ]
+        image_data = _image_data(image_path, revision)
+        total_image_bytes += len(image_data)
+        if total_image_bytes > max_total_bytes:
+            raise WorkflowError(
+                f"本次请求题图原始总大小超过 {max_total_bytes} 字节上限；"
+                "请按 Question ID 边界分批。"
+            )
+        encoded = base64.b64encode(image_data).decode("ascii")
+        source_ids = [source.source_id for source in sources]
         content.append(
             {
                 "type": "text",
@@ -107,6 +178,7 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
     timeout = int(ai_config.get("timeout_seconds", 180))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            request_id = response.headers.get("x-request-id")
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -122,6 +194,13 @@ def call_openai(prompt: str, bundle: SubjectBundle, config: dict[str, Any]) -> s
         raise WorkflowError("OpenAI API 请求超时。") from exc
 
     try:
-        return extract_chat_response_text(json.loads(raw))
+        payload = json.loads(raw)
+        return AIResult(
+            text=extract_chat_response_text(payload),
+            role=role,
+            model=str(payload.get("model") or model),
+            endpoint=endpoint,
+            request_id=request_id,
+        )
     except json.JSONDecodeError as exc:
         raise WorkflowError("OpenAI API 返回的内容不是有效 JSON。") from exc

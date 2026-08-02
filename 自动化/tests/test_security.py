@@ -1,7 +1,9 @@
+import base64
 import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -12,13 +14,18 @@ from tempfile import TemporaryDirectory
 AUTOMATION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AUTOMATION_DIR))
 
-from wrong_questions.foundation import ROOT, Source  # noqa: E402
+from wrong_questions.foundation import ROOT, Source, SubjectBundle  # noqa: E402
 from wrong_questions.audit import audit_markdown_references, audit_repository, classify_reference  # noqa: E402
-from wrong_questions.question_index import assign_question_ids, question_id_for_image  # noqa: E402
+from wrong_questions.question_index import (  # noqa: E402
+    assign_question_ids,
+    build_index_records,
+    question_id_for_image,
+)
 from wrong_questions.pipeline_validation import validate_generated_output  # noqa: E402
 from wrong_questions.repo_paths import read_repo_image, resolve_repo_file, resolve_repo_image  # noqa: E402
 from wrong_questions.report_io import workflow_lock, write_report_pair  # noqa: E402
 from wrong_questions.run_metadata import run_metadata_block, run_metadata_payload  # noqa: E402
+from wrong_questions import git_store, repo_paths  # noqa: E402
 
 
 class SecurityAndPipelineTests(unittest.TestCase):
@@ -180,6 +187,158 @@ class SecurityAndPipelineTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 question_id_for_image(path, {"schema_version": 2, "questions": []})
 
+    def test_initial_index_does_not_create_two_ids_for_same_new_image(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            first = root / "第一题.png"
+            second = root / "第二题.png"
+            first.write_bytes(b"same new image")
+            second.write_bytes(first.read_bytes())
+            sources = [
+                Source("S001", "测试", image_path=first, headings=["第一题"]),
+                Source("S002", "测试", image_path=second, headings=["第二题"]),
+            ]
+            bundle = SubjectBundle("测试", [], sources, [], {})
+            problems: list[str] = []
+            index = build_index_records(
+                [bundle],
+                {"schema_version": 2, "questions": []},
+                snapshot_commit="fixture-commit",
+                problems=problems,
+            )
+
+            self.assertEqual(index["questions"], [])
+            self.assertTrue(index["conflicts"])
+            self.assertTrue(all(source.question_id is None for source in sources))
+            self.assertTrue(any("共享同一图片" in problem for problem in problems))
+
+    def test_image_hash_wins_over_ambiguous_shared_heading(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            first_path = root / "第一题.png"
+            second_path = root / "第二题.png"
+            first_path.write_bytes(b"image-one")
+            second_path.write_bytes(b"image-two")
+            initial_sources = [
+                Source("S001", "测试", image_path=first_path, headings=["同一标题"]),
+                Source("S002", "测试", image_path=second_path, headings=["同一标题"]),
+            ]
+            initial = build_index_records(
+                [SubjectBundle("测试", [], initial_sources, [], {})],
+                {"schema_version": 2, "questions": []},
+                snapshot_commit="fixture-commit",
+            )
+            refreshed_sources = [
+                Source("S003", "测试", image_path=first_path, headings=["同一标题"]),
+                Source("S004", "测试", image_path=second_path, headings=["同一标题"]),
+            ]
+            problems: list[str] = []
+            assign_question_ids(refreshed_sources, initial, problems=problems)
+
+            self.assertEqual(
+                {source.question_id for source in refreshed_sources},
+                {record["question_id"] for record in initial["questions"]},
+            )
+            self.assertEqual(problems, [])
+
+    def test_tracked_revision_reads_snapshot_bytes_not_worktree_bytes(self):
+        image_a = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            image = root / "题图.png"
+            note = root / "笔记.md"
+            image.write_bytes(image_a)
+            note.write_text("# 题目\n\n![[题图.png]]\n", encoding="utf-8")
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", *args],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "fixture@example.test")
+            git("config", "user.name", "fixture")
+            git("add", ".")
+            git("commit", "-qm", "snapshot A")
+            revision = git("rev-parse", "HEAD")
+
+            image.write_bytes(b"worktree-B")
+            note.write_text("# 工作区版本 B\n\n![[题图.png]]\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "snapshot B")
+
+            with mock.patch.object(git_store, "ROOT", root), mock.patch.object(
+                repo_paths, "ROOT", root
+            ):
+                from wrong_questions.ai_client import _image_data
+                from wrong_questions.source_scanner import build_subject_bundle, parse_note_images
+
+                bundle = build_subject_bundle(
+                    "测试",
+                    {"笔记.md": {"tracked"}},
+                    "笔记.md",
+                    set(),
+                    commits=None,
+                    revision=revision,
+                )
+                snapshot_note = bundle.note_texts[note]
+                self.assertIn("# 题目", snapshot_note)
+                self.assertNotIn("工作区版本 B", snapshot_note)
+
+                _, sources, problems = parse_note_images(
+                    note, "测试", note.read_text(encoding="utf-8"), revision=revision
+                )
+                self.assertEqual(problems, [])
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(sources[0].image_revision, revision)
+                self.assertEqual(_image_data(image, revision), image_a)
+
+    def test_verification_role_uses_verification_model_and_records_request(self):
+        class FakeResponse:
+            headers = {"x-request-id": "request-fixture"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return '{"model":"model-B","choices":[{"message":{"content":"校验结果"}}]}'.encode(
+                    "utf-8"
+                )
+
+        bundle = SubjectBundle("测试", [], [], [], {})
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "fixture-key",
+                "OPENAI_MODEL": "model-A",
+                "OPENAI_VERIFY_MODEL": "model-B",
+            },
+            clear=False,
+        ), mock.patch(
+            "wrong_questions.ai_client.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as urlopen:
+            from wrong_questions.ai_client import call_openai
+
+            result = call_openai("请核验", bundle, {"ai": {}}, role="verification")
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["model"], "model-B")
+        self.assertEqual(result.model, "model-B")
+        self.assertEqual(result.metadata()["request_id"], "request-fixture")
+
     def test_validation_does_not_claim_domain_validated_without_independent_check(self):
         result = validate_generated_output(
             generated=True,
@@ -255,6 +414,33 @@ class SecurityAndPipelineTests(unittest.TestCase):
         self.assertEqual(payload["tip_commit"], "tip-fixture")
         self.assertEqual(payload["source_commits"], ["tip-fixture", "base-fixture"])
         self.assertIsNone(payload["snapshot_commit"])
+
+    def test_run_metadata_uses_actual_ai_call_models(self):
+        payload = run_metadata_payload(
+            kind="fixture",
+            status="needs_review",
+            config={"git": {"tracked_ref": "HEAD"}},
+            prompts=["generation", "verification"],
+            ai_calls=[
+                {
+                    "role": "generation",
+                    "provider": "openai-compatible",
+                    "model": "model-A",
+                    "endpoint": "https://example.test/v1/chat/completions",
+                    "request_id": "req-A",
+                },
+                {
+                    "role": "verification",
+                    "provider": "openai-compatible",
+                    "model": "model-B",
+                    "endpoint": "https://example.test/v1/chat/completions",
+                    "request_id": "req-B",
+                },
+            ],
+        )
+        self.assertEqual(payload["generation_model"], "model-A")
+        self.assertEqual(payload["verification_model"], "model-B")
+        self.assertEqual(len(payload["ai_calls"]), 2)
 
 
 if __name__ == "__main__":

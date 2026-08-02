@@ -10,12 +10,13 @@ import hashlib
 import json
 import ntpath
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 from .foundation import ROOT, Source, SubjectBundle, WorkflowError
-from .git_store import relative_repo_path, resolve_commit
+from .git_store import read_git_bytes, relative_repo_path, resolve_commit
 from .repo_paths import resolve_repo_file
 
 
@@ -25,7 +26,10 @@ LEGACY_SCHEMA_VERSION = 1
 QuestionIdFactory = Callable[[Source, str | None], str]
 
 
-def _digest(path: Path) -> str:
+def _digest(path: Path, revision: str | None = None) -> str:
+    if revision:
+        data = read_git_bytes(revision, relative_repo_path(path))
+        return hashlib.sha256(data).hexdigest()
     resolved = resolve_repo_file(path)
     digest = hashlib.sha256()
     with resolved.open("rb") as stream:
@@ -57,7 +61,12 @@ def _safe_aliases(values: Iterable[Any]) -> set[str]:
         alias = value.replace("\\", "/").strip()
         while alias.startswith("./"):
             alias = alias[2:]
-        if alias and not ntpath.isabs(alias) and not urlparse(alias).scheme:
+        if (
+            alias
+            and not ntpath.isabs(alias)
+            and not urlparse(alias).scheme
+            and ".." not in alias.split("/")
+        ):
             aliases.add(alias)
     return aliases
 
@@ -87,10 +96,13 @@ def _migrate_record(value: dict[str, Any]) -> dict[str, Any]:
     record.setdefault("note_paths", [])
     record.setdefault("headings", [])
     record.setdefault("identity_key", None)
-    record.setdefault("first_seen_commit", None)
-    record.setdefault("last_seen_commit", None)
+    record.setdefault("first_indexed_commit", record.pop("first_seen_commit", None))
+    record.setdefault("last_indexed_commit", record.pop("last_seen_commit", None))
     record["path_aliases"] = sorted(_safe_aliases(record.get("path_aliases", [])))
     record["note_paths"] = sorted(_safe_aliases(record.get("note_paths", [])))
+    # 读取旧索引时兼容历史字段，但对外只暴露不夸大历史精度的新名称。
+    record.pop("first_seen_commit", None)
+    record.pop("last_seen_commit", None)
     return record
 
 
@@ -114,7 +126,12 @@ def load_question_index(path: Path = INDEX_PATH) -> dict[str, Any]:
         for item in questions
         if isinstance(item, dict) and item.get("question_id")
     ]
-    return {"schema_version": SCHEMA_VERSION, "questions": records}
+    conflicts = value.get("conflicts", [])
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "questions": records,
+        "conflicts": conflicts if isinstance(conflicts, list) else [],
+    }
 
 
 def _records_by_id(index: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -166,10 +183,84 @@ def _match_candidates(
     return list(candidates.values())
 
 
-def question_id_for_image(path: Path, index: dict[str, Any] | None = None) -> str:
+def _match_evidence(
+    source: Source,
+    image_sha: str | None,
+    index: dict[str, Any],
+) -> dict[str, Any]:
+    """返回按证据类型拆分的匹配结果，避免单个旧路径静默继承新题 ID。"""
+
+    by_id = _records_by_id(index)
+    if source.question_id and source.question_id in by_id:
+        return {
+            "image_sha": image_sha,
+            "alias_ids": set(),
+            "image_ids": set(),
+            "identity_ids": set(),
+            "matches": [by_id[source.question_id]],
+            "conflict": None,
+        }
+    aliases = {_normalize_text(value) for value in _source_aliases(source)}
+    alias_records = _records_by_value(index, "path_aliases", normalize=_normalize_text)
+    alias_matches = [
+        item for alias in aliases for item in alias_records.get(alias, [])
+    ]
+    image_matches = (
+        _records_by_value(index, "image_sha256").get(image_sha, [])
+        if image_sha
+        else []
+    )
+    identity = _identity_key(source)
+    identity_matches = _records_by_value(index, "identity_key").get(identity, [])
+
+    alias_ids = {str(item["question_id"]) for item in alias_matches}
+    image_ids = {str(item["question_id"]) for item in image_matches}
+    identity_ids = {str(item["question_id"]) for item in identity_matches}
+    conflict: str | None = None
+    selected_ids: set[str] = set()
+    if len(image_ids) > 1 or len(alias_ids) > 1:
+        conflict = "来源证据匹配到多个已有 Question ID"
+    elif image_ids and alias_ids and image_ids != alias_ids:
+        conflict = "图片哈希与路径别名指向不同的已有 Question ID"
+    elif image_ids:
+        # 图片哈希是强证据；同一标题下的其他题目不能因为共享章节标题而干扰它。
+        selected_ids = set(image_ids)
+    elif alias_ids:
+        selected_ids = set(alias_ids)
+    elif len(identity_ids) > 1:
+        conflict = "语义证据匹配到多个已有 Question ID"
+    elif identity_ids:
+        selected_ids = set(identity_ids)
+    if len(alias_ids) == 1 and not image_ids:
+        alias_record = next(item for item in alias_matches if item.get("question_id"))
+        old_image_sha = alias_record.get("image_sha256")
+        old_identity = alias_record.get("identity_key")
+        if (
+            image_sha
+            and old_image_sha
+            and image_sha != old_image_sha
+            and old_identity
+            and identity != old_identity
+        ):
+            conflict = "路径别名复用但图片和语义证据同时变化"
+    return {
+        "image_sha": image_sha,
+        "alias_ids": alias_ids,
+        "image_ids": image_ids,
+        "identity_ids": identity_ids,
+        "matches": [by_id[question_id] for question_id in sorted(selected_ids)],
+        "conflict": conflict,
+    }
+
+
+def question_id_for_image(
+    path: Path,
+    index: dict[str, Any] | None = None,
+    revision: str | None = None,
+) -> str:
     """从已持久化索引解析题图 ID；未登记或冲突时拒绝猜测。"""
 
-    image_sha = _digest(path)
+    image_sha = _digest(path, revision)
     value = index if index is not None else load_question_index()
     matches = _records_by_value(value, "image_sha256").get(image_sha, [])
     ids = sorted({str(item["question_id"]) for item in matches})
@@ -191,28 +282,66 @@ def assign_question_ids(
     create_missing: bool = False,
     id_factory: QuestionIdFactory = _new_question_id,
     problems: list[str] | None = None,
+    conflicts: list[dict[str, Any]] | None = None,
 ) -> list[Source]:
     """按索引匹配来源；新增 ID 只允许在显式生成索引时创建。"""
 
     value = index or {"schema_version": SCHEMA_VERSION, "questions": []}
-    claimed: dict[str, str] = {}
+    source_list = list(sources)
+    observations: list[tuple[Source, dict[str, Any]]] = []
+    for source in source_list:
+        image_sha = _digest(source.image_path, source.image_revision) if source.image_path else None
+        observations.append((source, _match_evidence(source, image_sha, value)))
+
+    # 同一轮首建中多个未登记来源共享相同图片/语义时，不猜测它们是否是同一道题。
+    new_groups: dict[str, list[Source]] = {}
+    for source, evidence in observations:
+        if evidence["conflict"]:
+            continue
+        if not evidence["matches"]:
+            key = evidence["image_sha"] or f"identity:{_identity_key(source)}"
+            new_groups.setdefault(key, []).append(source)
+    duplicate_new_keys = {key for key, group in new_groups.items() if len(group) > 1}
     assigned: list[Source] = []
-    for source in sources:
-        image_sha = _digest(source.image_path) if source.image_path else None
-        matches = _match_candidates(source, image_sha, value)
-        ids = sorted({str(item["question_id"]) for item in matches})
-        if len(ids) > 1:
+    claimed: dict[str, str] = {}
+    for source, evidence in observations:
+        image_sha = evidence["image_sha"]
+        ids = sorted(
+            {
+                str(item["question_id"])
+                for item in evidence["matches"]
+                if item.get("question_id")
+            }
+        )
+        new_key = image_sha or f"identity:{_identity_key(source)}"
+        if evidence["conflict"] or len(ids) > 1 or (
+            not ids and new_key in duplicate_new_keys
+        ):
             source.question_id = None
             if problems is not None:
+                reason = evidence["conflict"] or (
+                    "本次首建中多个来源共享同一图片/语义证据"
+                )
                 problems.append(
-                    f"来源 `{source.title}` 匹配到多个 Question ID：{', '.join(ids)}；待人工确认。"
+                    f"来源 `{source.title}` 无法自动分配 Question ID（未登记来源）："
+                    f"{reason}；待人工确认。"
+                )
+            if conflicts is not None:
+                conflicts.append(
+                    {
+                        "status": "conflict",
+                        "reason": evidence["conflict"] or "duplicate_new_evidence",
+                        "source": source.title,
+                        "image_sha256": image_sha,
+                        "path_aliases": sorted(_source_aliases(source)),
+                    }
                 )
             assigned.append(source)
             continue
         question_id: str | None = ids[0] if ids else None
         if image_sha and question_id:
             prior_claim = claimed.get(image_sha)
-            if prior_claim:
+            if prior_claim and prior_claim != question_id:
                 question_id = None
                 if problems is not None:
                     problems.append(
@@ -222,6 +351,8 @@ def assign_question_ids(
                 claimed[image_sha] = question_id
         if question_id is None and create_missing:
             question_id = id_factory(source, image_sha)
+            if image_sha:
+                claimed[image_sha] = question_id
         if question_id is None and problems is not None:
             problems.append(
                 f"来源 `{source.title}` 尚未登记 Question ID；请运行 `index` 生成持久索引。"
@@ -238,7 +369,11 @@ def _source_record(
 ) -> dict[str, Any]:
     image_path = relative_repo_path(source.image_path) if source.image_path else None
     note_path = relative_repo_path(source.note_path) if source.note_path else None
-    image_sha = _digest(source.image_path) if source.image_path else None
+    image_sha = (
+        _digest(source.image_path, source.image_revision)
+        if source.image_path
+        else None
+    )
     aliases = _source_aliases(source)
     return {
         "question_id": source.question_id,
@@ -249,8 +384,8 @@ def _source_record(
         "note_paths": [note_path] if note_path else [],
         "headings": list(source.headings),
         "identity_key": _identity_key(source),
-        "first_seen_commit": snapshot_commit,
-        "last_seen_commit": snapshot_commit,
+        "first_indexed_commit": snapshot_commit,
+        "last_indexed_commit": snapshot_commit,
     }
 
 
@@ -266,9 +401,15 @@ def build_index_records(
     existing_index = {
         "schema_version": SCHEMA_VERSION,
         "questions": [_migrate_record(item) for item in existing_index.get("questions", [])],
+        "conflicts": (
+            existing_index.get("conflicts", [])
+            if isinstance(existing_index.get("conflicts", []), list)
+            else []
+        ),
     }
     by_id = _records_by_id(existing_index)
     local_problems: list[str] = []
+    local_conflicts: list[dict[str, Any]] = []
     for bundle in bundles:
         sources = assign_question_ids(
             bundle.sources,
@@ -276,6 +417,7 @@ def build_index_records(
             create_missing=True,
             id_factory=id_factory,
             problems=local_problems,
+            conflicts=local_conflicts,
         )
         for source in sources:
             if not source.question_id:
@@ -290,17 +432,61 @@ def build_index_records(
                 _safe_aliases(prior.get("note_paths", []))
                 | _safe_aliases(record["note_paths"])
             )
-            record["first_seen_commit"] = (
-                prior.get("first_seen_commit") or snapshot_commit
+            record["first_indexed_commit"] = (
+                prior.get("first_indexed_commit") or snapshot_commit
             )
-            record["last_seen_commit"] = snapshot_commit or prior.get("last_seen_commit")
+            record["last_indexed_commit"] = snapshot_commit or prior.get(
+                "last_indexed_commit"
+            )
             by_id[source.question_id] = {**prior, **record}
     if problems is not None:
         problems.extend(local_problems)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "questions": [by_id[key] for key in sorted(by_id)],
     }
+    if local_conflicts:
+        result["conflicts"] = local_conflicts
+    validate_index_invariants(result)
+    return result
+
+
+def validate_index_invariants(index: dict[str, Any]) -> None:
+    """阻止把相互矛盾的永久身份写入索引。"""
+
+    seen_ids: set[str] = set()
+    image_ids: dict[str, set[str]] = {}
+    alias_ids: dict[str, set[str]] = {}
+    for record in index.get("questions", []):
+        if not isinstance(record, dict) or not record.get("question_id"):
+            raise WorkflowError("题目索引包含缺少 question_id 的正式记录。")
+        question_id = str(record["question_id"])
+        if question_id in seen_ids:
+            raise WorkflowError(f"题目索引中 Question ID 重复：{question_id}")
+        seen_ids.add(question_id)
+        if str(record.get("status", "active")) != "active":
+            continue
+        image_sha = record.get("image_sha256")
+        if image_sha:
+            image_ids.setdefault(str(image_sha), set()).add(question_id)
+        for alias in _safe_aliases(record.get("path_aliases", [])):
+            alias_ids.setdefault(alias, set()).add(question_id)
+    duplicate_images = {
+        value: ids for value, ids in image_ids.items() if len(ids) > 1
+    }
+    if duplicate_images:
+        raise WorkflowError(
+            "题目索引中同一图片哈希映射多个 active Question ID："
+            + "; ".join(f"{value[:12]}={sorted(ids)}" for value, ids in duplicate_images.items())
+        )
+    duplicate_aliases = {
+        value: ids for value, ids in alias_ids.items() if len(ids) > 1
+    }
+    if duplicate_aliases:
+        raise WorkflowError(
+            "题目索引中同一路径别名映射多个 active Question ID："
+            + "; ".join(f"{value}={sorted(ids)}" for value, ids in duplicate_aliases.items())
+        )
 
 
 def write_question_index(value: dict[str, Any], path: Path = INDEX_PATH) -> Path:
@@ -315,27 +501,37 @@ def generate_question_index(
 ) -> tuple[dict[str, Any], list[str]]:
     from .source_scanner import tracked_subject_bundle
     from .git_store import read_uncommitted_paths
+    from .report_io import workflow_lock
 
-    subjects = config.get("subjects", {})
-    if subject_filter and subject_filter not in subjects:
-        raise WorkflowError(f"未知科目 `{subject_filter}`；可选科目：{', '.join(subjects)}")
-    dirty_paths = read_uncommitted_paths()
-    tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
-    snapshot_commit = resolve_commit(tracked_ref)
-    bundles = [
-        tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
-        for subject, configured_path in subjects.items()
-        if not subject_filter or subject == subject_filter
-    ]
-    problems = [problem for bundle in bundles for problem in bundle.problems]
-    factory = _provisional_question_id if dry_run else _new_question_id
-    index = build_index_records(
-        bundles,
-        load_question_index(),
-        snapshot_commit=snapshot_commit,
-        id_factory=factory,
-        problems=problems,
-    )
-    if not dry_run:
-        write_question_index(index)
-    return index, problems
+    lock_context = nullcontext() if dry_run else workflow_lock()
+    with lock_context:
+        subjects = config.get("subjects", {})
+        if subject_filter and subject_filter not in subjects:
+            raise WorkflowError(f"未知科目 `{subject_filter}`；可选科目：{', '.join(subjects)}")
+        dirty_paths = read_uncommitted_paths()
+        tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
+        snapshot_commit = resolve_commit(tracked_ref)
+        bundles = [
+            tracked_subject_bundle(subject, configured_path, dirty_paths, tracked_ref)
+            for subject, configured_path in subjects.items()
+            if not subject_filter or subject == subject_filter
+        ]
+        # 资料扫描阶段会提示“尚未登记”，但 index 命令本身正是登记动作；
+        # 保留真实路径、内容和冲突问题，避免把预期的首建提示误报为失败。
+        problems = [
+            problem
+            for bundle in bundles
+            for problem in bundle.problems
+            if "尚未登记 Question ID" not in problem
+        ]
+        factory = _provisional_question_id if dry_run else _new_question_id
+        index = build_index_records(
+            bundles,
+            load_question_index(),
+            snapshot_commit=snapshot_commit,
+            id_factory=factory,
+            problems=problems,
+        )
+        if not dry_run:
+            write_question_index(index)
+        return index, problems

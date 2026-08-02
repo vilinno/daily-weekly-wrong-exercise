@@ -8,8 +8,17 @@ from typing import Iterable
 from urllib.parse import unquote
 
 from .foundation import Commit, HEADING_RE, IMAGE_RE, IMAGE_SUFFIXES, OBSIDIAN_IMAGE_RE, ROOT, Source, SubjectBundle, WorkflowError
-from .git_store import normalize_repo_path, note_deltas_for_scope, relative_repo_path, repo_path, run_git
-from .repo_paths import resolve_repo_image
+from .git_store import (
+    normalize_repo_path,
+    note_deltas_for_scope,
+    read_git_bytes,
+    read_git_file,
+    relative_repo_path,
+    repo_path,
+    resolve_commit,
+    run_git,
+)
+from .repo_paths import resolve_repo_image, resolve_repo_image_candidates
 from .question_index import assign_question_ids, load_question_index
 
 def parse_image_target(inner: str) -> str:
@@ -46,18 +55,33 @@ def iter_image_targets(line: str) -> Iterable[str]:
         if raw_ref:
             yield raw_ref
 
-def resolve_image_reference(note_path: Path, raw_ref: str) -> Path | None:
+def resolve_image_reference(
+    note_path: Path, raw_ref: str, revision: str | None = None
+) -> Path | None:
     decoded = unquote(raw_ref.strip())
     if not decoded:
         return None
     try:
+        base_dirs = (
+            note_path.parent,
+            note_path.parent / "assets",
+            note_path.parent.parent / "assets",
+        )
+        if revision:
+            for candidate in resolve_repo_image_candidates(
+                decoded,
+                base_dirs=base_dirs,
+                unique_basename_fallback=False,
+            ):
+                try:
+                    read_git_bytes(revision, relative_repo_path(candidate))
+                except WorkflowError:
+                    continue
+                return candidate
+            return None
         return resolve_repo_image(
             decoded,
-            base_dirs=(
-                note_path.parent,
-                note_path.parent / "assets",
-                note_path.parent.parent / "assets",
-            ),
+            base_dirs=base_dirs,
             unique_basename_fallback=True,
         )
     except WorkflowError:
@@ -92,7 +116,10 @@ def note_section_context(
     return "\n".join(lines[section_start:section_end]).strip()[:max_chars]
 
 def parse_note_images(
-    note_path: Path, subject: str, content: str | None = None
+    note_path: Path,
+    subject: str,
+    content: str | None = None,
+    revision: str | None = None,
 ) -> tuple[str, list[Source], list[str]]:
     if content is None:
         content = note_path.read_text(encoding="utf-8", errors="replace")
@@ -111,7 +138,7 @@ def parse_note_images(
             heading_stack.append((level, title))
 
         for raw_ref in iter_image_targets(line):
-            image_path = resolve_image_reference(note_path, raw_ref)
+            image_path = resolve_image_reference(note_path, raw_ref, revision)
             key = (relative_repo_path(note_path), relative_repo_path(image_path)) if image_path else (
                 relative_repo_path(note_path), raw_ref
             )
@@ -133,6 +160,8 @@ def parse_note_images(
                     headings=[title for _, title in heading_stack],
                     context=context,
                     line_number=line_number + 1,
+                    note_revision=revision,
+                    image_revision=revision if image_path else None,
                 )
             )
 
@@ -218,6 +247,7 @@ def incremental_note_sources(
     subject: str,
     content: str,
     line_ranges: list[tuple[int, int]],
+    revision: str | None = None,
 ) -> tuple[list[Source], list[str]]:
     """从 Markdown 的 Git 新行范围中构造本次增量来源。"""
     if not line_ranges:
@@ -236,7 +266,9 @@ def incremental_note_sources(
     if not line_ranges:
         return [], []
 
-    _, all_sources, problems = parse_note_images(note_path, subject, content)
+    _, all_sources, problems = parse_note_images(
+        note_path, subject, content, revision=revision
+    )
     result: list[Source] = []
     covered_range_indexes: set[int] = set()
 
@@ -304,6 +336,7 @@ def incremental_note_sources(
                 note_path=note_path,
                 context=changed_context(content, unlinked_ranges),
                 change_kind="笔记新增/修改",
+                note_revision=revision,
             )
         )
 
@@ -330,6 +363,7 @@ def build_subject_bundle(
     configured_path: str,
     dirty_paths: set[str] | None = None,
     commits: Iterable[Commit] | None = None,
+    revision: str | None = None,
 ) -> SubjectBundle:
     prefix = configured_path.replace("\\", "/").strip("/")
     dirty_paths = {normalize_repo_path(path) for path in (dirty_paths or set())}
@@ -344,10 +378,21 @@ def build_subject_bundle(
     seen_image_paths: set[Path] = set()
     changed_images: list[Path] = []
     note_deltas = note_deltas_for_scope(commits, changed_paths) if commits else {}
+    if revision is None and note_deltas:
+        revision = next(iter(note_deltas.values())).revision
+
+    def present_in_revision(path: Path, relative_path: str) -> bool:
+        if revision is None:
+            return path.exists()
+        try:
+            read_git_bytes(revision, relative_path)
+        except WorkflowError:
+            return False
+        return True
 
     for relative_path in subject_changed:
         path = repo_path(relative_path)
-        if path.suffix.lower() in IMAGE_SUFFIXES and path.exists():
+        if path.suffix.lower() in IMAGE_SUFFIXES and present_in_revision(path, relative_path):
             changed_images.append(path)
 
     for relative_path in subject_changed:
@@ -359,7 +404,7 @@ def build_subject_bundle(
             )
             continue
         note_path = repo_path(relative_path)
-        if not note_path.exists():
+        if revision is None and not note_path.exists():
             problems.append(f"提交中涉及的 Markdown 当前不存在：`{relative_path}`")
             continue
         if commits is not None:
@@ -371,7 +416,11 @@ def build_subject_bundle(
                 continue
             content = delta.content
             note_sources, note_problems = incremental_note_sources(
-                note_path, subject, content, delta.line_ranges
+                note_path,
+                subject,
+                content,
+                delta.line_ranges,
+                revision=delta.revision or revision,
             )
             if not delta.line_ranges:
                 statuses = ", ".join(sorted(changed_paths.get(relative_path, set())))
@@ -380,7 +429,19 @@ def build_subject_bundle(
                     f"（变更状态：{statuses or '未知'}）；未计为新增题目。"
                 )
         else:
-            content, note_sources, note_problems = parse_note_images(note_path, subject)
+            if revision is not None:
+                try:
+                    content = read_git_file(revision, relative_path)
+                except WorkflowError as exc:
+                    problems.append(
+                        f"无法读取 tracked_ref 中的 Markdown：`{relative_path}`（{exc}）"
+                    )
+                    continue
+            else:
+                content = note_path.read_text(encoding="utf-8", errors="replace")
+            content, note_sources, note_problems = parse_note_images(
+                note_path, subject, content, revision=revision
+            )
         note_texts[note_path] = content
         sources.extend(note_sources)
         problems.extend(note_problems)
@@ -436,6 +497,7 @@ def build_subject_bundle(
                 source_id="",
                 subject=subject,
                 image_path=image_path,
+                image_revision=revision,
                 context=(
                     "该题图已被 Git 跟踪，但当前未在任何 Markdown 中找到对应引用。"
                     if full_scan
@@ -482,6 +544,7 @@ def tracked_subject_bundle(
 ) -> SubjectBundle:
     """扫描 HEAD 中已跟踪的整科资料，用于复盘和纠错。"""
     prefix = configured_path.replace("\\", "/").strip("/")
+    snapshot_commit = resolve_commit(tracked_ref)
     output = run_git(
         "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", tracked_ref
     )
@@ -500,4 +563,5 @@ def tracked_subject_bundle(
         configured_path,
         dirty_paths=dirty_paths,
         commits=None,
+        revision=snapshot_commit,
     )

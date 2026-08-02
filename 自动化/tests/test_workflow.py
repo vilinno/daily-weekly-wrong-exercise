@@ -48,6 +48,12 @@ class WorkflowUnitTests(unittest.TestCase):
         with self.assertRaises(main.WorkflowError):
             main.validate_config({"timezone": "UTC"})
 
+    def test_validate_config_checks_anki_schedule_values(self):
+        config = main.load_config()
+        config["subject_specs"][0]["anki"]["desired_retention"] = 1.5
+        with self.assertRaises(main.WorkflowError):
+            main.validate_config(config)
+
     def test_commit_message_rules(self):
         self.assertTrue(main.is_allowed_message("daily: 2026-07-21"))
         self.assertTrue(main.is_allowed_message("docs: 更新说明"))
@@ -395,6 +401,96 @@ class WorkflowUnitTests(unittest.TestCase):
         )
 
         self.assertEqual(issues, [])
+
+    def test_review_quality_requires_sources_for_each_question_and_answer_pair(self):
+        test = """## 掌握度测试
+1. 第一题（来源：S001）
+
+2. 第二题
+"""
+        answer = """## 答案与核验
+1. 第一题答案（来源：S002）
+
+2. 第二题答案（来源：S001）
+"""
+
+        issues = main.review_output_quality_issues(
+            test, answer, {"S001", "S002"}, expected_questions=2
+        )
+
+        self.assertTrue(any("第 2 题题目部分没有来源" in issue for issue in issues))
+        self.assertTrue(any("第 1 题题目与答案的来源编号没有交集" in issue for issue in issues))
+
+    def test_rejected_weekly_output_isolated_from_formal_report(self):
+        from wrong_questions import weekly_workflow
+
+        with TemporaryDirectory(dir=main.ROOT) as directory:
+            root = Path(directory)
+            report_path = root / "周测.md"
+            answer_path = root / "周测-答案.md"
+            commit = main.Commit(
+                "fixture-tip",
+                main.parse_git_datetime("2026-07-31T08:00:00+08:00"),
+                "daily: 2026-07-31",
+            )
+            source = main.Source("S001", "测试", headings=["fixture"])
+            bundle = main.SubjectBundle("测试", [], [source], [], {})
+            generated = (
+                "<SUMMARY>\n## 总结\n来源：S001\n</SUMMARY>\n"
+                "<TEST>\n## 测试题\n1. 题目（来源：S001）\n</TEST>\n"
+                "<ANSWER>\n## 答案与核验\n1. 答案（来源：S001）\n</ANSWER>"
+            )
+            captured_pair: list[tuple[Path, str, Path, str, bool]] = []
+            captured_raw: list[tuple[Path, str, bool]] = []
+            config = main.load_config()
+            config["subjects"] = {"测试": "测试"}
+            config["git"]["tracked_ref"] = "HEAD"
+            fake_result = main.AIResult(
+                generated,
+                "generation",
+                "fixture-model",
+                "https://example.test/v1/chat/completions",
+            )
+            with patch.object(weekly_workflow, "read_commits", return_value=[commit]), patch.object(
+                weekly_workflow, "commits_for_week", return_value=[commit]
+            ), patch.object(
+                weekly_workflow, "parent_commit_sha", return_value="fixture-base"
+            ), patch.object(
+                weekly_workflow, "collect_changed_paths", return_value={}
+            ), patch.object(
+                weekly_workflow, "build_subject_bundle", return_value=bundle
+            ), patch.object(
+                weekly_workflow, "call_openai", return_value=fake_result
+            ), patch.object(
+                weekly_workflow,
+                "write_report_pair",
+                side_effect=lambda first, first_content, second, second_content, write: captured_pair.append(
+                    (first, first_content, second, second_content, write)
+                ),
+            ), patch.object(
+                weekly_workflow,
+                "write_or_preview_report",
+                side_effect=lambda path, content, write: captured_raw.append((path, content, write)),
+            ):
+                weekly_workflow.weekly_report_for_subject(
+                    "测试",
+                    "测试",
+                    main.parse_datetime("2026-07-31T00:00:00+08:00"),
+                    main.parse_datetime("2026-08-01T08:00:00+08:00"),
+                    config,
+                    True,
+                    report_path,
+                    answer_path,
+                    write=False,
+                    dirty_paths=set(),
+                )
+
+            self.assertEqual(len(captured_pair), 1)
+            self.assertEqual(len(captured_raw), 1)
+            formal_question = captured_pair[0][1]
+            self.assertIn("已被自动门禁拒绝", formal_question)
+            self.assertNotIn("1. 题目（来源：S001）", formal_question)
+            self.assertIn("1. 题目（来源：S001）", captured_raw[0][1])
 
     def test_remove_incomplete_choice_from_verified_review(self):
         test = """## 掌握度测试

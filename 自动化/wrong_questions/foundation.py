@@ -29,7 +29,7 @@ ALLOWED_MESSAGE_RES = (
     DAILY_RE,
     DAILY_COMPAT_RE,
     WEEKLY_RE,
-    re.compile(r"^(?:docs|chore|fix): .+$"),
+    re.compile(r"^(?:feat|refactor|test|ci|build|perf|docs|chore|fix): .+$"),
 )
 IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]*)\)")
 OBSIDIAN_IMAGE_RE = re.compile(r"!\[\[([^\]\r\n]+)\]\]")
@@ -93,6 +93,9 @@ class Source:
     change_kind: str = "题目"
     line_number: int | None = None
     question_id: str | None = None
+    # Source 的路径用于报告链接；revision 用于保证内容读取来自声明的 Git 快照。
+    note_revision: str | None = None
+    image_revision: str | None = None
 
     @property
     def title(self) -> str:
@@ -211,10 +214,76 @@ def validate_config(config: Any) -> dict[str, Any]:
         config["subject_specs"] = subject_specs
     if not isinstance(subjects, dict) or not subjects:
         raise WorkflowError("subjects 必须是非空列表（兼容旧版对象映射）。")
+    if "subject_specs" not in config:
+        config["subject_specs"] = [
+            {"name": subject, "path": configured_path}
+            for subject, configured_path in subjects.items()
+        ]
     for subject, configured_path in subjects.items():
         path = str(configured_path).replace("\\", "/").strip("/")
         if not subject or not path or ntpath.isabs(str(configured_path)) or urlparse(str(configured_path)).scheme or ".." in path.split("/"):
             raise WorkflowError(f"subjects.{subject} 必须是仓库内相对目录。")
+
+    deck_names: set[str] = set()
+    preset_names: set[str] = set()
+    for spec in config["subject_specs"]:
+        if not isinstance(spec, dict):
+            raise WorkflowError("subject_specs 中的每项必须是对象。")
+        name = str(spec.get("name", "")).strip()
+        if name not in subjects:
+            raise WorkflowError(f"subject_specs 中的科目未出现在 subjects：{name}")
+        anki = spec.get("anki", {})
+        if not isinstance(anki, dict):
+            raise WorkflowError(f"subject_specs.{name}.anki 必须是对象。")
+        deck = str(anki.get("deck", f"每日错题::{name}")).strip()
+        preset = str(anki.get("preset", f"{name}错题")).strip()
+        if not deck or not preset:
+            raise WorkflowError(f"subject_specs.{name} 的 deck 和 preset 不能为空。")
+        if deck in deck_names:
+            raise WorkflowError(f"Anki deck 名称重复：{deck}")
+        if preset in preset_names:
+            raise WorkflowError(f"Anki preset 名称重复：{preset}")
+        deck_names.add(deck)
+        preset_names.add(preset)
+        try:
+            desired_retention = float(anki.get("desired_retention", 0.9))
+            new_per_day = int(anki.get("new_per_day", 10))
+            review_modifier = float(anki.get("review_modifier", 1.0))
+            max_interval = int(anki.get("max_interval", 36500))
+        except (TypeError, ValueError) as exc:
+            raise WorkflowError(f"subject_specs.{name}.anki 数值配置无效。") from exc
+        if not 0 < desired_retention <= 1:
+            raise WorkflowError(f"subject_specs.{name}.desired_retention 必须在 0 到 1 之间。")
+        if new_per_day < 0:
+            raise WorkflowError(f"subject_specs.{name}.new_per_day 不能小于 0。")
+        if review_modifier <= 0:
+            raise WorkflowError(f"subject_specs.{name}.review_modifier 必须大于 0。")
+        if max_interval <= 0:
+            raise WorkflowError(f"subject_specs.{name}.max_interval 必须大于 0。")
+
+        def number_list(key: str, default: list[float], integer: bool = False) -> list[int | float]:
+            raw = anki.get(key, default)
+            if not isinstance(raw, list) or not raw:
+                raise WorkflowError(f"subject_specs.{name}.{key} 必须是非空数组。")
+            try:
+                values = [int(value) if integer else float(value) for value in raw]
+            except (TypeError, ValueError) as exc:
+                raise WorkflowError(f"subject_specs.{name}.{key} 必须全部是数字。") from exc
+            if any(value < 0 for value in values):
+                raise WorkflowError(f"subject_specs.{name}.{key} 不能包含负数。")
+            return values
+
+        spec["anki"] = {
+            "deck": deck,
+            "preset": preset,
+            "desired_retention": desired_retention,
+            "new_per_day": new_per_day,
+            "new_delays": number_list("new_delays", [10.0]),
+            "new_intervals": number_list("new_intervals", [3, 10, 0], integer=True),
+            "review_modifier": review_modifier,
+            "max_interval": max_interval,
+            "lapse_delays": number_list("lapse_delays", [30.0]),
+        }
     if not isinstance(reports, dict) or not reports.get("daily") or not reports.get("weekly"):
         raise WorkflowError("reports 必须配置 daily 和 weekly 输出目录。")
     if not isinstance(review, dict):

@@ -70,6 +70,8 @@ def correction_report_for_subject(
     run_id = uuid.uuid4().hex
     question_ids = [source.question_id for source in bundle.sources]
     prompts: list[str] = []
+    ai_calls: list[dict[str, str | None]] = []
+    model_rechecked = False
     pipeline_issues = list(bundle.problems)
     generation_failed = False
     lines = [
@@ -99,21 +101,28 @@ def correction_report_for_subject(
             try:
                 prompt = correction_prompt(note_bundle, note_path, content)
                 prompts.append(prompt)
-                draft = call_openai(
+                result = call_openai(
                     prompt,
                     note_bundle,
                     config,
+                    role="generation",
                 )
+                ai_calls.append(result.metadata())
+                draft = result.text
                 if bool(config.get("ai", {}).get("verify_corrections", True)):
                     verification_prompt = correction_verification_prompt(
                         note_bundle, note_path, content, draft
                     )
                     prompts.append(verification_prompt)
-                    generated = call_openai(
+                    result = call_openai(
                         verification_prompt,
                         note_bundle,
                         config,
+                        role="verification",
                     )
+                    ai_calls.append(result.metadata())
+                    generated = result.text
+                    model_rechecked = True
                 else:
                     generated = draft
                 generated = mark_correction_as_unverified(generated)
@@ -169,6 +178,8 @@ def correction_report_for_subject(
         ["", run_metadata_block(
             kind="correction", status=status, config=config,
             question_ids=question_ids, prompts=prompts,
+            ai_calls=ai_calls,
+            model_rechecked=model_rechecked,
             issues=metadata_issues, run_id=run_id,
             snapshot_commit=snapshot_commit, scope_kind="snapshot",
         ), ""]

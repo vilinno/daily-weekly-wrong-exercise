@@ -71,6 +71,25 @@ def resolve_repo_image(
 ) -> Path:
     """在仓库内解析题图；所有候选路径最终都经过 resolve_repo_file。"""
 
+    candidates = resolve_repo_image_candidates(
+        raw_ref,
+        base_dirs=base_dirs,
+        unique_basename_fallback=unique_basename_fallback,
+    )
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    raise WorkflowError(f"题图无法解析：`{raw_ref}`（未找到唯一匹配项）")
+
+
+def resolve_repo_image_candidates(
+    raw_ref: str | Path,
+    *,
+    base_dirs: tuple[Path, ...] = (),
+    unique_basename_fallback: bool = False,
+) -> list[Path]:
+    """返回安全的候选路径，包括当前工作区尚不存在但可由 Git blob 提供的路径。"""
+
     value = unquote(str(raw_ref).strip())
     if ntpath.isabs(value) or Path(value).is_absolute() or urlparse(value).scheme:
         raise WorkflowError(f"拒绝绝对或远程题图引用：`{raw_ref}`")
@@ -80,15 +99,21 @@ def resolve_repo_image(
 
     candidates: list[tuple[str | Path, Path | None]] = [(value, None)]
     candidates.extend((value, directory) for directory in base_dirs)
-    errors: list[str] = []
+    resolved_candidates: list[Path] = []
+    seen: set[Path] = set()
     for candidate, base_dir in candidates:
         try:
-            path = resolve_repo_file(candidate, base_dir=base_dir)
+            path = resolve_repo_file(
+                candidate,
+                base_dir=base_dir,
+                must_exist=False,
+                must_be_file=False,
+            )
         except WorkflowError as exc:
-            errors.append(str(exc))
             continue
-        if path.suffix.lower() in IMAGE_SUFFIXES:
-            return path
+        if path.suffix.lower() in IMAGE_SUFFIXES and path not in seen:
+            seen.add(path)
+            resolved_candidates.append(path)
 
     has_parent_segment = ".." in value.replace("\\", "/").split("/")
     if unique_basename_fallback and not has_parent_segment:
@@ -100,36 +125,35 @@ def resolve_repo_image(
             and path.name.casefold() == basename
         ]
         if len(matches) == 1:
-            return resolve_repo_file(matches[0].relative_to(_repo_root()))
+            resolved = resolve_repo_file(matches[0].relative_to(_repo_root()))
+            if resolved not in seen:
+                resolved_candidates.append(resolved)
 
-    detail = errors[-1] if errors else "未找到唯一匹配项"
-    raise WorkflowError(f"题图无法解析：`{raw_ref}`（{detail}）")
+    if not resolved_candidates:
+        raise WorkflowError(f"题图无法解析：`{raw_ref}`（未找到安全候选路径）")
+    return resolved_candidates
 
 
-def read_repo_image(path: str | Path) -> bytes:
-    """安全读取题图，并验证真实图片结构、大小和像素上限。"""
+def validate_image_bytes(data: bytes, path_hint: str | Path) -> bytes:
+    """验证图片字节，供工作区文件和 Git blob 共用同一安全边界。"""
 
-    resolved = resolve_repo_file(path)
-    try:
-        file_size = resolved.stat().st_size
-    except OSError as exc:
-        raise WorkflowError(f"图片文件无法读取：`{resolved}`") from exc
-    if file_size > MAX_IMAGE_BYTES:
+    path_text = str(path_hint).replace("\\", "/")
+    suffix = Path(path_text).suffix.lower()
+    display_path = path_text
+    if len(data) > MAX_IMAGE_BYTES:
         raise WorkflowError(
-            f"图片超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MiB 大小上限：`{resolved}`"
+            f"图片超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MiB 大小上限：`{display_path}`"
         )
-    data = resolved.read_bytes()
-    suffix = resolved.suffix.lower()
-    valid = (
-        (suffix == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
-        or (suffix in {".jpg", ".jpeg"} and data.startswith(b"\xff\xd8\xff"))
-        or (suffix == ".gif" and data.startswith((b"GIF87a", b"GIF89a")))
-        or (suffix == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
-        or (suffix == ".bmp" and data.startswith(b"BM"))
-    )
-    if not valid:
-        raise WorkflowError(f"图片文件头与扩展名不匹配：`{resolved.relative_to(_repo_root()).as_posix()}`")
     try:
+        valid = (
+            (suffix == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
+            or (suffix in {".jpg", ".jpeg"} and data.startswith(b"\xff\xd8\xff"))
+            or (suffix == ".gif" and data.startswith((b"GIF87a", b"GIF89a")))
+            or (suffix == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+            or (suffix == ".bmp" and data.startswith(b"BM"))
+        )
+        if not valid:
+            raise WorkflowError(f"图片文件头与扩展名不匹配：`{display_path}`")
         from PIL import Image
         from PIL import ImageFile
 
@@ -139,16 +163,27 @@ def read_repo_image(path: str | Path) -> bytes:
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
                 raise WorkflowError(
-                    f"图片像素超过 {MAX_IMAGE_PIXELS} 上限：`{resolved}`"
+                    f"图片像素超过 {MAX_IMAGE_PIXELS} 上限：`{display_path}`"
                 )
             image.verify()
     except WorkflowError:
         raise
     except ImportError as exc:
-        raise WorkflowError("真实图片校验需要安装 Pillow：`python -m pip install -r Anki/requirements.txt`") from exc
+        raise WorkflowError("真实图片校验需要安装 Pillow：`python -m pip install -r requirements-core.txt`") from exc
     except (OSError, ValueError) as exc:
-        raise WorkflowError(f"图片内容无法通过真实格式校验：`{resolved}`（{exc}）") from exc
+        raise WorkflowError(f"图片内容无法通过真实格式校验：`{display_path}`（{exc}）") from exc
     return data
+
+
+def read_repo_image(path: str | Path) -> bytes:
+    """安全读取题图，并验证真实图片结构、大小和像素上限。"""
+
+    resolved = resolve_repo_file(path)
+    try:
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise WorkflowError(f"图片文件无法读取：`{resolved}`") from exc
+    return validate_image_bytes(data, resolved)
 
 
 def repo_relative(path: str | Path) -> str:

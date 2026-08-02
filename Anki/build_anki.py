@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_DIR = ROOT / "自动化"
 if str(AUTOMATION_DIR) not in sys.path:
     sys.path.insert(0, str(AUTOMATION_DIR))
-from wrong_questions.foundation import WorkflowError  # noqa: E402
+from wrong_questions.foundation import WorkflowError, load_config  # noqa: E402
 from wrong_questions.repo_paths import read_repo_image, resolve_repo_file, resolve_repo_image  # noqa: E402
 from wrong_questions.question_index import load_question_index, question_id_for_image  # noqa: E402
 OUTPUT_DIR = ROOT / "Anki"
@@ -54,10 +54,8 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 def subject_specs() -> list[dict[str, object]]:
     """从配置读取科目和 Anki 参数，不按科目名称写死构建逻辑。"""
 
-    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
-    subjects = config.get("subjects", [])
-    if isinstance(subjects, dict):
-        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
+    config = load_config()
+    subjects = config.get("subject_specs", [])
     specs: list[dict[str, object]] = []
     for item in subjects:
         anki = dict(item.get("anki", {})) if isinstance(item, dict) else {}
@@ -124,12 +122,9 @@ def is_question_heading(text: str) -> bool:
 
 def note_files() -> list[tuple[str, Path]]:
     found: list[tuple[str, Path]] = []
-    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
-    subjects = config.get("subjects", [])
-    if isinstance(subjects, dict):
-        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
-    for item in subjects:
-        group, configured_path = str(item["name"]), str(item["path"])
+    config = load_config()
+    for group, configured_path in config["subjects"].items():
+        group, configured_path = str(group), str(configured_path)
         subject_root = resolve_repo_file(configured_path, must_exist=True, must_be_file=False)
         for path in sorted(subject_root.rglob("*.md")):
             found.append((group, path))
@@ -209,12 +204,9 @@ def extract_images(markdown_text: str) -> list[ImageRef]:
 
 def image_index() -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = {}
-    config = json.loads((ROOT / "自动化" / "config.json").read_text(encoding="utf-8"))
-    subjects = config.get("subjects", [])
-    if isinstance(subjects, dict):
-        subjects = [{"name": name, "path": path} for name, path in subjects.items()]
-    for item in subjects:
-        subject_root = resolve_repo_file(str(item["path"]), must_exist=True, must_be_file=False)
+    config = load_config()
+    for configured_path in config["subjects"].values():
+        subject_root = resolve_repo_file(str(configured_path), must_exist=True, must_be_file=False)
         for path in subject_root.rglob("*"):
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
                 index.setdefault(path.name.casefold(), []).append(path.resolve())

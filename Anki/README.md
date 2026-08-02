@@ -21,6 +21,7 @@
 在仓库根目录运行：
 
 ```powershell
+python -m pip install -r requirements-core.txt
 python -m pip install -r Anki/requirements.txt
 python Anki/build_anki.py
 ```

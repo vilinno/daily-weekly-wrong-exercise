@@ -48,6 +48,21 @@ def review_output_quality_issues(
     if not used_ids:
         issues.append("题目和答案没有引用来源编号。")
 
+    # 来源核验必须落到每一道题，不能因为整份文本某处出现过 S001 就放过
+    # 其他无来源题目；答案还要与对应题目的来源至少有一个交集。
+    for number in sorted(set(test_items) | set(answer_items)):
+        test_ids = set(SOURCE_ID_RE.findall(test_items.get(number, "")))
+        answer_ids = set(SOURCE_ID_RE.findall(answer_items.get(number, "")))
+        if not test_ids:
+            issues.append(f"第 {number} 题题目部分没有来源编号。")
+        if not answer_ids:
+            issues.append(f"第 {number} 题答案部分没有来源编号。")
+        if test_ids and answer_ids and not test_ids.intersection(answer_ids):
+            issues.append(
+                f"第 {number} 题题目与答案的来源编号没有交集："
+                f"题目={sorted(test_ids)}，答案={sorted(answer_ids)}。"
+            )
+
     option_pattern = re.compile(r"(?m)^\s*(?:[-*]\s*)?[A-DＡ-Ｄ][.、．)]\s*")
     answer_choice_pattern = re.compile(r"(?:选|答案(?:是|为)?[:：]?\s*)[A-DＡ-Ｄ]\b")
     for number, item in test_items.items():

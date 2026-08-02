@@ -24,7 +24,7 @@ def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
         "|---|---|---|---|---|---|",
     ]
     for source in bundle.sources:
-        if source.image_path and source.image_path.exists():
+        if source.image_path:
             image_cell = obsidian_link(
                 None,
                 obsidian_target(source.image_path),
@@ -33,7 +33,7 @@ def source_index_markdown(bundle: SubjectBundle, report_path: Path) -> str:
             image_cell = source.raw_image_ref
         else:
             image_cell = "—"
-        if source.note_path and source.note_path.exists():
+        if source.note_path:
             note_cell = obsidian_link(
                 None,
                 obsidian_target(source.note_path),
@@ -54,7 +54,11 @@ def source_payload(bundle: SubjectBundle) -> str:
         parts.append(f"- 科目：{source.subject}")
         parts.append(f"- 变更类型：{source.change_kind}")
         parts.append(f"- 题图仓库路径：{relative_repo_path(source.image_path) if source.image_path else '未解析'}")
+        if source.image_revision:
+            parts.append(f"- 题图读取提交：`{source.image_revision}`")
         parts.append(f"- Markdown 路径：{relative_repo_path(source.note_path) if source.note_path else '无'}")
+        if source.note_revision:
+            parts.append(f"- Markdown 读取提交：`{source.note_revision}`")
         parts.append(f"- 知识点/题型位置：{source.title}")
         if source.context:
             parts.append("- 相关 Markdown 上下文：")

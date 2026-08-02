@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .foundation import ROOT, WorkflowError
-from .git_store import collect_changed_paths, commits_for_week, parent_commit_sha, read_commits, read_uncommitted_paths
+from .git_store import collect_changed_paths, commits_for_week, parent_commit_sha, read_commits, read_uncommitted_paths, relative_repo_path
 from .source_scanner import build_subject_bundle
 from .markdown_tools import format_commit_list, source_index_markdown
 from .prompts import weekly_prompt
@@ -45,11 +45,14 @@ def weekly_report_for_subject(
         configured_path,
         dirty_paths,
         commits=weekly_commits,
+        revision=tip_commit,
     )
     run_id = uuid.uuid4().hex
     question_ids = [source.question_id for source in bundle.sources]
     prompts: list[str] = []
+    ai_calls: list[dict[str, str | None]] = []
     generation_failed = False
+    raw_output = ""
 
     metadata = [
         f"> 生成时间：{end.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
@@ -106,8 +109,11 @@ def weekly_report_for_subject(
         try:
             prompt = weekly_prompt(bundle, start, end, config)
             prompts.append(prompt)
-            generated = call_openai(prompt, bundle, config)
+            result = call_openai(prompt, bundle, config, role="generation")
+            ai_calls.append(result.metadata())
+            generated = result.text
             summary, test, answer = split_weekly_output(generated)
+            raw_output = generated
             summary = link_source_ids(summary, bundle, report_path)
             test = link_source_ids(test, bundle, report_path)
             answer = link_source_ids(answer, bundle, answer_path)
@@ -117,11 +123,13 @@ def weekly_report_for_subject(
             summary = f"## 过去一周总结\n\n> AI 生成失败：{exc}"
             test = "## 测试题\n\n> 因 AI 生成失败，本周未生成测试题。"
             answer = f"## 答案与核验\n\n> 无可核验内容。原始错误：{exc}"
+            raw_output = "\n\n".join([summary, test, answer])
     else:
         problems.append("使用 --no-ai，未生成可验证周测题和答案。")
         summary = "## 过去一周总结\n\n> 本次使用 `--no-ai`，未调用外部 AI。"
         test = "## 测试题\n\n> 本次使用 `--no-ai`，未生成测试题。"
         answer = "## 答案与核验\n\n> 本次使用 `--no-ai`，未生成答案。"
+        raw_output = "\n\n".join([summary, test, answer])
 
     valid_ids = {source.source_id for source in bundle.sources}
     generated_texts = [summary, test, answer]
@@ -168,9 +176,22 @@ def weekly_report_for_subject(
     metadata_block = run_metadata_block(
         kind="weekly", status=status, config=config,
         question_ids=question_ids, prompts=prompts, issues=metadata_issues, run_id=run_id,
+        ai_calls=ai_calls,
         base_commit=base_commit, tip_commit=tip_commit,
         source_commits=source_commits, scope_kind="range",
     )
+
+    raw_output_path: Path | None = None
+    if status == "rejected":
+        raw_output_path = ROOT / ".runs" / run_id / "raw-output.md"
+        write_or_preview_report(
+            raw_output_path,
+            "# 被拒绝的周测原始输出\n\n"
+            "> 此文件仅供人工诊断，不能作为正式测试或答案使用。\n\n"
+            + raw_output.rstrip()
+            + "\n",
+            write,
+        )
 
     common = [
         *metadata,
@@ -182,24 +203,24 @@ def weekly_report_for_subject(
     ]
     if problems:
         common.extend(["## 数据检查", "", *[f"- {problem}" for problem in problems], ""])
-    question_content = "\n".join(
-        [f"# 周测｜{subject}", "", *common, metadata_block, "", summary, "", test, "", "## 来源索引", "", source_index_markdown(bundle, report_path), ""]
-    )
-    answer_content = "\n".join(
-        [
-            f"# 周测答案与核验｜{subject}",
+    if status == "rejected":
+        rejected_notice = [
+            "## 状态",
             "",
-            *metadata,
-            "",
-            metadata_block,
-            "",
-            answer,
-            "",
-            "## 来源索引",
-            "",
-            source_index_markdown(bundle, answer_path),
+            "> 本次周测已被自动门禁拒绝，正式报告不展示被拒绝的题目或答案。",
+            f"> 原始输出仅保存于 `{relative_repo_path(raw_output_path)}`，请修复问题后重新生成。",
             "",
         ]
+        question_tail = rejected_notice
+        answer_tail = rejected_notice
+    else:
+        question_tail = [summary, "", test, ""]
+        answer_tail = [answer, ""]
+    question_content = "\n".join(
+        [f"# 周测｜{subject}", "", *common, metadata_block, "", *question_tail, "## 来源索引", "", source_index_markdown(bundle, report_path), ""]
+    )
+    answer_content = "\n".join(
+        [f"# 周测答案与核验｜{subject}", "", *metadata, "", metadata_block, "", *answer_tail, "## 来源索引", "", source_index_markdown(bundle, answer_path), ""]
     )
     write_report_pair(report_path, question_content, answer_path, answer_content, write)
     return report_path, answer_path

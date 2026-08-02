@@ -39,6 +39,7 @@ def daily_report(
     report_path = report_dir / f"日报-{target_date.isoformat()}.md"
     question_ids: list[str | None] = []
     prompts: list[str] = []
+    ai_calls: list[dict[str, str | None]] = []
     pipeline_issues: list[str] = []
     generation_failed = False
 
@@ -102,6 +103,7 @@ def daily_report(
                 configured_path,
                 dirty_paths,
                 commits=daily_commits,
+                revision=tip_commit,
             )
             question_ids.extend(source.question_id for source in bundle.sources)
             pipeline_issues.extend(bundle.problems)
@@ -121,7 +123,9 @@ def daily_report(
                 try:
                     prompt = daily_prompt(bundle, target_date, config)
                     prompts.append(prompt)
-                    generated = call_openai(prompt, bundle, config)
+                    result = call_openai(prompt, bundle, config, role="generation")
+                    ai_calls.append(result.metadata())
+                    generated = result.text
                     generated = link_source_ids(generated, bundle, report_path)
                     valid_ids = {source.source_id for source in bundle.sources}
                     unknown_ids = validate_source_ids([generated], valid_ids)
@@ -163,6 +167,7 @@ def daily_report(
         ["", run_metadata_block(
             kind="daily", status=status, config=config,
             question_ids=question_ids, prompts=prompts, issues=metadata_issues,
+            ai_calls=ai_calls,
             base_commit=base_commit, tip_commit=tip_commit,
             source_commits=source_commits, scope_kind="range",
         ), ""]

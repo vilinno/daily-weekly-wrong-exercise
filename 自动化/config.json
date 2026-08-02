@@ -75,6 +75,8 @@
     "chat_completions_url": "",
     "max_output_tokens": 4096,
     "timeout_seconds": 180,
+    "max_images_per_request": 12,
+    "max_total_image_bytes": 40000000,
     "verify_reviews": true,
     "verify_corrections": true
   }

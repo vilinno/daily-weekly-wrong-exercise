@@ -38,6 +38,8 @@ def run_metadata_block(
     source_commits: Iterable[str] = (),
     snapshot_commit: str | None = None,
     scope_kind: str | None = None,
+    ai_calls: Iterable[dict[str, Any]] = (),
+    model_rechecked: bool = False,
 ) -> str:
     payload = run_metadata_payload(
         kind=kind,
@@ -52,6 +54,8 @@ def run_metadata_block(
         source_commits=source_commits,
         snapshot_commit=snapshot_commit,
         scope_kind=scope_kind,
+        ai_calls=ai_calls,
+        model_rechecked=model_rechecked,
     )
     display_issues = payload["issues"]
     lines = [
@@ -68,6 +72,8 @@ def run_metadata_block(
         f"- source_commits：`{', '.join(payload['source_commits']) if payload['source_commits'] else '无'}`",
         f"- generation_model：`{payload['generation_model']}`",
         f"- verification_model：`{payload['verification_model']}`",
+        f"- domain_verification：`{payload['domain_verification']}`",
+        f"- ai_calls：`{len(payload['ai_calls'])}`",
         f"- prompt_version：`{payload['prompt_version']}`",
         f"- prompt_sha256：`{payload['prompt_sha256']}`",
         f"- question_ids：`{', '.join(payload['question_ids']) if payload['question_ids'] else '无'}`",
@@ -97,21 +103,42 @@ def run_metadata_payload(
     source_commits: Iterable[str] = (),
     snapshot_commit: str | None = None,
     scope_kind: str | None = None,
+    ai_calls: Iterable[dict[str, Any]] = (),
+    model_rechecked: bool = False,
 ) -> dict[str, Any]:
     if status not in {"validated", "needs_review", "rejected"}:
         raise WorkflowError(f"未知流水线状态：{status}")
     if scope_kind not in {None, "range", "snapshot"}:
         raise WorkflowError(f"未知 Git 范围类型：{scope_kind}")
     tracked_ref = str(config.get("git", {}).get("tracked_ref", "refs/heads/main"))
-    ai = config.get("ai", {})
-    generation_model = os.environ.get("OPENAI_MODEL", "").strip() or str(
-        ai.get("default_model", "未配置")
-    )
-    verification_model = os.environ.get("OPENAI_VERIFY_MODEL", "").strip() or str(
-        ai.get("verify_model", generation_model)
-    )
-    ids = sorted({value for value in question_ids if value})
     prompt_values = tuple(value for value in prompts if value)
+    normalized_ai_calls = [
+        {
+            "role": str(call.get("role", "")),
+            "provider": str(call.get("provider", "")),
+            "model": str(call.get("model", "")),
+            "endpoint": str(call.get("endpoint", "")),
+            "request_id": call.get("request_id"),
+        }
+        for call in ai_calls
+        if isinstance(call, dict) and call.get("model")
+    ]
+
+    def actual_models(role: str) -> str:
+        models = list(
+            dict.fromkeys(
+                call["model"]
+                for call in normalized_ai_calls
+                if call["role"] == role and call["model"]
+            )
+        )
+        if models:
+            return "；".join(models)
+        return "未确认" if prompt_values else "未调用"
+
+    generation_model = actual_models("generation")
+    verification_model = actual_models("verification")
+    ids = sorted({value for value in question_ids if value})
     if scope_kind == "range":
         actual_base = base_commit
         actual_tip = tip_commit
@@ -140,6 +167,8 @@ def run_metadata_payload(
         "source_commits": commits,
         "generation_model": generation_model if prompt_values else "未调用",
         "verification_model": verification_model if prompt_values else "未调用",
+        "domain_verification": "model_rechecked" if model_rechecked else "not_run",
+        "ai_calls": normalized_ai_calls,
         "prompt_version": config.get("pipeline", {}).get("prompt_version", "v1"),
         "prompt_sha256": prompt_digest(prompt_values),
         "question_ids": ids,

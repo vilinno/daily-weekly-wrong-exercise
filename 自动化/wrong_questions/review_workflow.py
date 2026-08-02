@@ -52,8 +52,9 @@ def review_report_for_subject(
     run_id = uuid.uuid4().hex
     question_ids = [source.question_id for source in selected.sources]
     prompts: list[str] = []
+    ai_calls: list[dict[str, str | None]] = []
     generation_failed = False
-    independent_verified = False
+    model_rechecked = False
     final_quality_issues: list[str] = []
     final_leakage_issues: list[str] = []
 
@@ -61,7 +62,9 @@ def review_report_for_subject(
         try:
             base_prompt = review_prompt(selected, statuses, target_date, config)
             prompts.append(base_prompt)
-            generated = call_openai(base_prompt, selected, config)
+            result = call_openai(base_prompt, selected, config, role="generation")
+            ai_calls.append(result.metadata())
+            generated = result.text
             test, answer = split_review_output(generated)
             valid_ids = {source.source_id for source in selected.sources}
             quality_issues = review_output_quality_issues(
@@ -70,11 +73,14 @@ def review_report_for_subject(
             if quality_issues:
                 repair_prompt = review_repair_prompt(base_prompt, generated, quality_issues)
                 prompts.append(repair_prompt)
-                generated = call_openai(
+                result = call_openai(
                     repair_prompt,
                     selected,
                     config,
+                    role="generation",
                 )
+                ai_calls.append(result.metadata())
+                generated = result.text
                 test, answer = split_review_output(generated)
                 quality_issues = review_output_quality_issues(
                     test, answer, valid_ids, question_limit
@@ -89,11 +95,14 @@ def review_report_for_subject(
                     selected, generated, question_limit
                 )
                 prompts.append(verification_prompt)
-                generated = call_openai(
+                result = call_openai(
                     verification_prompt,
                     selected,
                     config,
+                    role="verification",
                 )
+                ai_calls.append(result.metadata())
+                generated = result.text
                 test, answer = split_review_output(generated)
                 quality_issues = review_output_quality_issues(
                     test, answer, valid_ids, question_limit
@@ -111,7 +120,7 @@ def review_report_for_subject(
                             "复盘题二次核验结果未通过自动质量检查："
                             + "；".join(quality_issues)
                         )
-                independent_verified = True
+                model_rechecked = True
             final_quality_issues = review_output_quality_issues(
                 test, answer, valid_ids, question_limit
             )
@@ -149,7 +158,9 @@ def review_report_for_subject(
         hard_failure=generation_failed,
         structure_verified=bool(prompts) and not generation_failed and not final_quality_issues,
         sources_verified=bool(prompts) and not generation_failed,
-        domain_verified=independent_verified,
+        # 当前核验模型仍输出修订后的 TEST/ANSWER，而非逐题结构化 verdict；
+        # 因此只能记录为 model_rechecked，不能冒充领域已验证。
+        domain_verified=False,
         requires_answer_pair=True,
         answer_pair_verified=bool(prompts) and not generation_failed and not final_quality_issues,
         answer_leakage_free=bool(prompts) and not generation_failed and not final_leakage_issues,
@@ -166,6 +177,8 @@ def review_report_for_subject(
     metadata_block = run_metadata_block(
         kind="review", status=status, config=config,
         question_ids=question_ids, prompts=prompts, issues=metadata_issues, run_id=run_id,
+        ai_calls=ai_calls,
+        model_rechecked=model_rechecked,
         snapshot_commit=snapshot_commit, scope_kind="snapshot",
     )
     question_lines = [

@@ -43,7 +43,7 @@ wrong_questions/
 - 每科题量：约 10 题，目标为约 70% 原题/原题改编、30% 变式题。
 - 不读取未提交内容，不自动提交生成物。
 - 所有 Markdown、题图和 Anki 媒体必须经过仓库内安全路径入口；远程 URL、Windows 绝对路径、路径逃逸、仓库外符号链接和伪装图片会被拒绝。
-- 图片读取不仅检查文件头，还使用 Pillow 校验真实格式、文件大小和像素上限；完整构建依赖见 `Anki/requirements.txt`。
+- 图片读取不仅检查文件头，还使用 Pillow 校验真实格式、文件大小和像素上限；核心依赖见仓库根目录 `requirements-core.txt`，Anki 构建依赖见 `Anki/requirements.txt`。
 - Git 只扫描 `config.json` 中 `git.tracked_ref` 的祖先链，不使用 `git log --all`；merge commit 不作为 daily 来源。
 - 写模式工作流从收集阶段起持有独占锁，锁记录 pid、主机、启动时间和 run_id，并能识别已退出进程留下的陈旧锁；周测、复盘题目与答案先准备两个临时文件再成对替换，失败时恢复已有文件。
 - `audit` 只读扫描过渡站、Markdown 引用、路径安全、孤立/重复题图、科目目录、Question ID 索引和报告状态；发现问题返回非零并保留 JSON/Markdown findings，不自动修复资料。
@@ -106,13 +106,19 @@ weekly: 2026-W30
 docs: 修改说明
 chore: 初始化或维护说明
 fix: 修复说明
+feat: 新增功能
+refactor: 重构实现
+test: 测试与 fixture
+ci: 持续集成
+build: 构建与依赖
+perf: 性能优化
 ```
 
 每日脚本把 `daily: YYYY-MM-DD` 作为规范格式；历史兼容的 `daily:YYYY-MM-DD` 仍可解析，但会在报告中标记为不规范。`git.tracked_ref` 默认是 `refs/heads/main`，启动时必须验证该 ref 存在；可用各子命令的 `--tracked-ref` 临时覆盖，不会扫描其他 ref。
 
 ## Question ID 与索引
 
-Question ID 由 `index` 首次写入索引时随机生成并持久保存。图片 SHA-256、路径别名和不含行号的语义指纹只用于匹配；图片内容变化、笔记移动或路径别名变化不会直接生成新的哈希 ID。未登记、同一图片对应多个记录或一次扫描中重复图片哈希都会保留为待确认，不静默合并。
+Question ID 由 `index` 首次写入索引时随机生成并持久保存。图片 SHA-256、路径别名和不含行号的语义指纹只用于匹配；图片内容变化、笔记移动或路径别名变化不会直接生成新的哈希 ID。未登记、同一图片对应多个记录或一次扫描中重复图片哈希都会保留为待确认，不静默合并。索引只记录 `first_indexed_commit`/`last_indexed_commit`，不把首次索引时间冒充题目首次进入 Git 的时间。
 
 首次使用 Anki 或复盘前，应先运行 `python 自动化/main.py index --dry-run` 检查问题，再运行 `python 自动化/main.py index` 并提交 `索引/题目索引.json`。没有持久索引的题图不会伪造 Question ID，Anki 会将其列入待补清单。
 
@@ -126,7 +132,9 @@ Question ID 由 `index` 首次写入索引时随机生成并持久保存。图�
 
 ## 配置 AI
 
-脚本使用 OpenAI 兼容的 Chat Completions API，并将题图作为 `image_url` Base64 图片输入。模型以 `config.json` 的 `ai.default_model` 为默认值，可使用 `OPENAI_MODEL` 覆盖；核验模型可使用 `OPENAI_VERIFY_MODEL` 单独配置。
+脚本使用 OpenAI 兼容的 Chat Completions API，并将题图作为 `image_url` Base64 图片输入。模型以 `config.json` 的 `ai.default_model` 为默认值，可使用 `OPENAI_MODEL` 覆盖；核验模型可使用 `OPENAI_VERIFY_MODEL` 单独配置。每次真实请求返回的角色、实际模型、端点和 request id 会写入运行元数据；核验模型仍输出修订稿时标记为 `model_rechecked`，不会被冒充为结构化领域验证。
+
+日报、周测、复盘和纠错都会把 Markdown 与题图绑定到本次 Git revision；外部 AI 读取图片时从对应 Git blob 取字节，不使用当前 checkout 中可能不同的同路径文件。单次请求默认最多 12 张题图、40,000,000 字节，可在 `ai` 配置中调整，但超过上限必须按题目边界分批。
 
 推荐配置方式：
 

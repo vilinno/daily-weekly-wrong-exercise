@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -25,6 +26,28 @@ def run_git(*args: str) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise WorkflowError(f"Git 命令执行失败：git {' '.join(args)}\n{detail}")
     return completed.stdout
+
+
+def run_git_bytes(*args: str) -> bytes:
+    """运行 Git 并保留原始字节，供图片等非文本 blob 使用。"""
+
+    command = ["git", "-C", str(ROOT), *args]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        if not detail:
+            detail = completed.stdout.decode("utf-8", errors="replace").strip()
+        raise WorkflowError(f"Git 命令执行失败：git {' '.join(args)}\n{detail}")
+    return completed.stdout
+
+
+@lru_cache(maxsize=8192)
+def _read_git_bytes_cached(root_text: str, commit_sha: str, safe_path: str) -> bytes:
+    return run_git_bytes("-c", "core.quotePath=false", "show", f"{commit_sha}:{safe_path}")
 
 def normalize_repo_path(relative_path: str) -> str:
     normalized = relative_path.replace("\\", "/")
@@ -105,15 +128,16 @@ def parent_commit_sha(commit_sha: str) -> str:
 
 def read_git_file(commit_sha: str, relative_path: str) -> str:
     """读取指定提交中的 UTF-8 文本文件。"""
+    return read_git_bytes(commit_sha, relative_path).decode("utf-8", errors="replace")
+
+
+def read_git_bytes(commit_sha: str, relative_path: str) -> bytes:
+    """读取指定提交中的原始文件 blob，不回退到当前工作区。"""
+
     safe_path = resolve_repo_file(
         normalize_repo_path(relative_path), must_exist=False, must_be_file=False
     ).relative_to(ROOT.resolve()).as_posix()
-    return run_git(
-        "-c",
-        "core.quotePath=false",
-        "show",
-        f"{commit_sha}:{safe_path}",
-    )
+    return _read_git_bytes_cached(str(ROOT.resolve()), commit_sha, safe_path)
 
 def parse_diff_new_line_ranges(diff_text: str) -> list[tuple[int, int]]:
     """解析 unified diff 中对应新文件的行范围。"""
